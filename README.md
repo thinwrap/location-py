@@ -1,7 +1,5 @@
 # thinwrap-location (Python)
 
-> ⚠️ **Work in progress (v0).** A faithful Python port of [`@thinwrap/location`](https://github.com/thinwrap/location-ts) (TypeScript), [`thinwrap/location`](https://github.com/thinwrap/location-php) (PHP), and [`thinwrap/location-go`](https://github.com/thinwrap/location-go) (Go): one unified facade per operation over **6 providers × 4 operations = 21 connectors**, with the same normalized surface and error model.
-
 Unified, **SDK-free**, **zero-runtime-dependency** Python wrapper for routing,
 distance matrix, geocoding, and isochrone across **Google, Mapbox, HERE, ESRI,
 TomTom, and OSRM**. Switch vendor by changing the config type; the input and
