@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thinwrap-location"
+version = "1.0.0"
+description = "Lightweight, SDK-free, zero-dependency Python wrapper for routing, distance matrix, geocoding, and isochrone across Google, Mapbox, HERE, ESRI, TomTom, and OSRM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Dmitry Polyanovsky" }]
+keywords = ["routing", "geocoding", "isochrone", "distance-matrix", "maps", "google", "mapbox", "here", "esri", "tomtom", "osrm"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://thinwrap.dev"
+Repository = "https://github.com/thinwrap/location-py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["thinwrap.location*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
