@@ -47,6 +47,18 @@ Generate a key at https://console.cloud.google.com/google/maps-apis/credentials 
 
 The standard `RoutingOptions` shape applies as-is: `waypoints`, `travel_mode`, `optimize`, `departure_time`, `avoid_tolls`, `avoid_ferries`, `avoid_highways`. Provider-specific Routes v2 features (lane guidance, route modifiers) go via `passthrough.body`.
 
+### `waypoint_order` and Google's `[-1]` answer
+
+Google reports the optimized order as `routes.optimizedIntermediateWaypointIndex`, over the
+INTERMEDIATE waypoints only. The connector projects that onto the canonical `waypoint_order`
+(all input indices, in visit order, origin/destination inclusive).
+
+Google does **not** always return real indices: when it declines to optimize it answers
+`[-1]`. The connector validates the projection and **omits `waypoint_order` entirely** unless it
+is a complete permutation of `[0..N-1]` — so a `None` `waypoint_order` means "no usable ordering", never
+a silently corrupt one. The rest of the result (legs, totals, polyline, raw) is returned as
+normal, and the raw body still carries the vendor's own field if you need to inspect it.
+
 ### Error mapping
 
 | Vendor HTTP | Vendor signal | `ProviderCode` |
@@ -73,10 +85,44 @@ res = routing.route(RoutingOptions(
     waypoints=[origin, destination],
     passthrough=Passthrough(
         body={"languageCode": "fr", "units": "IMPERIAL"},
-        headers={"X-Goog-FieldMask": "routes.legs.distanceMeters,routes.duration,routes.warnings"},
+        # The mask REPLACES the connector's own — re-list the fields it needs, then add yours.
+        headers={
+            "X-Goog-FieldMask": "routes.legs.distanceMeters,routes.legs.duration,"
+            "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
+            "routes.warnings"
+        },
     ),
 ))
 ```
+
+### Turn-by-turn instructions
+
+Off by default and **not normalized** — `RoutingResult` has no `steps` attribute. Add the step
+fields to the mask and read them from `res.raw`, which carries Google's response verbatim:
+
+```python
+res = routing.route(RoutingOptions(
+    waypoints=[origin, destination],
+    passthrough=Passthrough(headers={
+        "X-Goog-FieldMask": "routes.legs.distanceMeters,routes.legs.duration,"
+        "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
+        "routes.legs.steps.navigationInstruction"
+    }),
+))
+```
+
+Instruction text is at `routes[].legs[].steps[].navigationInstruction.instructions`; the icon
+enum is at `.maneuver`.
+
+> **The mask is replaced, not merged.** `Passthrough(headers=...)` overrides `X-Goog-FieldMask`
+> wholesale, so the five baseline fields above have to stay. Drop
+> `routes.polyline.encodedPolyline` and `polyline` comes back `""`; drop a distance or duration
+> and the matching normalized field comes back `0`. Nothing raises — absent values are coalesced,
+> so the failure looks like a real zero-length route.
+
+Requesting steps does not change the SKU: the Compute Routes SKU is selected by request
+*features* (`TRAFFIC_AWARE`, two-wheel routing), not by requested fields. It does enlarge the
+response considerably.
 
 ---
 
@@ -141,3 +187,50 @@ res = geo.geocode(GeocodeOptions(
     passthrough=Passthrough(query={"region": "us", "language": "en", "components": "country:US"}),
 ))
 ```
+
+### Country filter
+
+`country_filter` is ISO 3166-1 alpha-2 throughout this library, and each operation
+translates it into the parameter that operation's endpoint actually takes:
+
+| Operation | Parameter |
+|---|---|
+| `geocode()` | `components=country:XX\|country:YY` |
+| `autocomplete()` | `includedRegionCodes` (JSON body) |
+
+```python
+res = geo.autocomplete(AutocompleteOptions(input="Dizen", country_filter=["IL", "PS"]))
+# → body["includedRegionCodes"] == ["il", "ps"]
+```
+
+Two things the translation handles for you, because both fail quietly otherwise:
+
+- **Autocomplete takes ccTLD codes, not ISO**, and the two disagree on the United
+  Kingdom — ISO `GB` is ccTLD `uk`. Passing `GB` through unchanged returns no UK
+  predictions rather than an error, so the connector rewrites it.
+- **Google caps the list at 15** and rejects the whole request over that. The connector
+  raises `invalid_request` before the round-trip.
+
+> **Setting a country filter also suppresses Google's *query* predictions.** It changes
+> which *kinds* of suggestion come back, not only how many — a query-type row (a search
+> term rather than a place) will no longer appear at all.
+
+### Match-highlighting offsets
+
+**Not normalized** — `AutocompletePrediction` has no `matches` attribute. Only 2 of the 5
+geocoders return offsets at all (Google and HERE), and they disagree on both the encoding
+and which string the offsets index, so this stays vendor-native in `raw`:
+
+```python
+res = geo.autocomplete(AutocompleteOptions(input="Dizen"))
+matches = res.raw["suggestions"][0]["placePrediction"]["structuredFormat"]["mainText"]["matches"]
+# → [{"startOffset": int, "endOffset": int}]
+```
+
+Available on `text`, `structuredFormat.mainText` and `structuredFormat.secondaryText`, and
+present by default — no extra request field and no extra cost.
+
+> These are Unicode code-point offsets. Python string indices are code points too, so
+> `text[start:end]` is correct here — Python is the one language in this family where the
+> obvious slice needs no conversion (JavaScript is UTF-16, PHP `substr` and Go slicing are
+> byte-based).

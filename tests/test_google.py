@@ -16,6 +16,7 @@ from thinwrap.location import (
     RoutingOptions,
     ReverseGeocodeOptions,
     AutocompleteOptions,
+    PlaceDetailsOptions,
 )
 
 TWO = [LatLng(40.7, -74.0), LatLng(41.4, -73.0)]
@@ -141,3 +142,36 @@ def test_autocomplete():
     res = g.autocomplete(AutocompleteOptions(input="New"))
     assert len(res.predictions) == 2
     assert res.predictions[0].description == "New York" and res.predictions[0].place_id == "pid"
+
+
+def test_session_token_wire_spelling():
+    """Google uses two DIFFERENT spellings for one concept.
+
+    A body field on the autocomplete leg, a query param on place details. Both
+    verified live, where a bogus name is rejected with INVALID_ARGUMENT — so these
+    are recognized parameters, not silently-ignored ones. Without them Autocomplete
+    is billed per REQUEST (per keystroke) instead of per session.
+    """
+    token = "3f2a1c58-9b4e-4d7a-8e21-6c5f0b7d9a34"
+
+    # autocomplete -> body field
+    fake = FakeTransport(resp(200, '{"suggestions":[{"placePrediction":{"placeId":"p1","text":{"text":"Diz"}}}]}'))
+    Geocoding(GoogleConfig(api_key="k"), transport=fake).autocomplete(
+        AutocompleteOptions(input="Diz", session_token=token)
+    )
+    assert body_json(fake.last)["sessionToken"] == token
+    assert "sessionToken" not in (fake.last.url.split("?", 1)[1] if "?" in fake.last.url else "")
+
+    # place_details -> query param
+    fake2 = FakeTransport(
+        resp(200, '{"id":"p1","formattedAddress":"Dizengoff St 50","location":{"latitude":32.0797,"longitude":34.7738}}')
+    )
+    Geocoding(GoogleConfig(api_key="k"), transport=fake2).place_details(
+        PlaceDetailsOptions(place_id="p1", session_token=token)
+    )
+    assert qget(fake2.last, "sessionToken") == token
+
+    # omitted when not supplied — never an empty parameter
+    fake3 = FakeTransport(resp(200, '{"suggestions":[]}'))
+    Geocoding(GoogleConfig(api_key="k"), transport=fake3).autocomplete(AutocompleteOptions(input="Diz"))
+    assert "sessionToken" not in body_json(fake3.last)

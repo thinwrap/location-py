@@ -62,7 +62,7 @@ def test_routing_directions():
 def test_routing_optimized():
     pts = [LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)]
     geom = encode_p6(pts)
-    fake = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"' + geom + '","legs":[],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":2},{"waypoint_index":1}]}'))
+    fake = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"' + geom + '","legs":[{"distance":5,"duration":6}],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":2},{"waypoint_index":1}]}'))
     r = Routing(MapboxConfig("tok"), transport=fake)
     res = r.route(RoutingOptions(waypoints=pts, optimize=True))
     assert res.waypoint_order == [0, 2, 1]
@@ -75,15 +75,19 @@ def test_routing_optimized():
 
 
 def test_routing_errors():
+    # The envelope code, not the status, is the no-route signal — live-verified
+    # that Mapbox serves it on 200 as well as 422.
     fake = FakeTransport(resp(422, '{"code":"NoRoute","message":"no route found"}'))
     with pytest.raises(ConnectorError) as ei:
         Routing(MapboxConfig("t"), transport=fake).route(RoutingOptions(waypoints=TWO))
-    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST and ei.value.provider_message == "no route found"
+    assert ei.value.provider_code == ProviderCode.NO_ROUTE and ei.value.provider_message == "no route found"
 
+    # NoSegment = no road near a coordinate to snap to, i.e. still "no usable
+    # route from here", not a malformed request.
     fake2 = FakeTransport(resp(200, '{"code":"NoSegment"}'))
     with pytest.raises(ConnectorError) as ei2:
         Routing(MapboxConfig("t"), transport=fake2).route(RoutingOptions(waypoints=TWO))
-    assert ei2.value.provider_code == ProviderCode.INVALID_REQUEST
+    assert ei2.value.provider_code == ProviderCode.NO_ROUTE
 
 
 def test_matrix():

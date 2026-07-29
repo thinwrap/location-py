@@ -13,16 +13,28 @@ The config type selects the provider; switching vendor is a one-line change::
 from __future__ import annotations
 
 from .config import EsriConfig, GoogleConfig, HereConfig, MapboxConfig, OsrmConfig, TomTomConfig
-from .enums import HereTransportMode, IsochroneType, ProviderID, TravelMode
+from .enums import (
+    HereTransportMode,
+    IsochroneType,
+    PlaceDetailsInclude,
+    PolylineQuality,
+    ProviderID,
+    RoutingInclude,
+    TrafficMode,
+    TravelMode,
+)
 from .errors import ConnectorError, ProviderCode
 from .facades import Geocoding, Isochrone, Matrix, Routing
 from .geocoding import (
     AutocompleteOptions,
     AutocompletePrediction,
     AutocompleteResult,
+    AutocompleteStructuredFormat,
     GeocodeCandidate,
     GeocodeOptions,
     GeocodeResult,
+    PlaceDetailsOptions,
+    PlaceDetailsResult,
     ReverseGeocodeOptions,
     ReverseGeocodeResult,
     Viewport,
@@ -36,12 +48,14 @@ from .routing import RoutingLeg, RoutingOptions, RoutingResult
 from .transport import HttpRequest, HttpResponse, Transport, UrllibTransport
 
 __all__ = [
+    "PlaceDetailsOptions", "PlaceDetailsResult", "AutocompleteStructuredFormat",
     # facades
     "Routing", "Matrix", "Geocoding", "Isochrone",
     # configs
     "GoogleConfig", "MapboxConfig", "HereConfig", "EsriConfig", "OsrmConfig", "TomTomConfig",
     # enums
     "ProviderID", "TravelMode", "IsochroneType", "HereTransportMode",
+    "PolylineQuality", "TrafficMode", "RoutingInclude", "PlaceDetailsInclude",
     # errors
     "ConnectorError", "ProviderCode",
     # core types

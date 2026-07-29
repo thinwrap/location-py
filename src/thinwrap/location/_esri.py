@@ -7,12 +7,13 @@ import datetime as _dt
 import json
 from typing import Any, List, Optional
 
-from ._jsonpath import jget, jlist, jnum, jstr
+from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
 from ._util import compact_json, decode_json, ok_status
+from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import EsriConfig
 from .coordinate import assert_finite, fmt_coord, to_lng_lat_string
-from .enums import IsochroneType, TravelMode
+from .enums import IsochroneType, PlaceDetailsInclude, TravelMode
 from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, unknown_error
 from .geocoding import (
     AutocompleteOptions,
@@ -21,6 +22,8 @@ from .geocoding import (
     GeocodeCandidate,
     GeocodeOptions,
     GeocodeResult,
+    PlaceDetailsOptions,
+    PlaceDetailsResult,
     ReverseGeocodeOptions,
     ReverseGeocodeResult,
     Viewport,
@@ -38,9 +41,10 @@ _GEOCODE_URL = "https://geocode-api.arcgis.com/arcgis/rest/services/World/Geocod
 _REVGEOCODE_URL = "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode"
 _SUGGEST_URL = "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/suggest"
 _SERVICE_AREA_URL = "https://route-api.arcgis.com/arcgis/rest/services/World/ServiceAreas/NAServer/ServiceArea_World/solveServiceArea"
-_STOP_MANEUVER = "esriDMTStop"
 _MIN_TO_SEC = 60
 _KM_TO_M = 1000
+# Only reached if a service reports distance in miles rather than kilometers.
+_METERS_PER_MILE = 1609.344
 
 
 def _esri_epoch_ms(d: _dt.datetime) -> str:
@@ -94,10 +98,17 @@ class EsriRoutingConnector(_EsriBase):
             "token": token,
             "stops": _esri_point_feature_set(wps),
             "returnRoutes": "true",
-            "returnDirections": "true",
-            "directionsLengthUnits": "esriNAUMeters",
-            "directionsOutputType": "esriDOTComplete",
-            "outputLines": "esriNAOutputLineTrueShapeWithMeasure",
+            # Legs come from the ``stops`` cumulative costs rather than the
+            # ``directions`` output: Esri documents that output as superseded, and its
+            # ``esriDMT*`` maneuver values are not enumerated in the REST reference.
+            "returnStops": "true",
+            # Explicit because the service default is ``true``, so omitting this still
+            # ships the whole turn-by-turn payload.
+            "returnDirections": "false",
+            # Produces the ``Cumul_<attr>`` fields; no ``impedanceAttributeName`` needed.
+            "accumulateAttributeNames": f"{_esri_time_attribute_for(opts.travel_mode)},Kilometers",
+            # Only ``paths`` is read; ``...WithMeasure`` adds an m-value per point.
+            "outputLines": "esriNAOutputLineTrueShape",
             "outSR": "4326",
         }
         if opts.optimize:
@@ -105,7 +116,6 @@ class EsriRoutingConnector(_EsriBase):
             # Needed to recover the optimized visiting order: the `stops`
             # FeatureSet carries each stop's 1-based Sequence (there is no
             # `Stops` route attribute).
-            form["returnStops"] = "true"
             if opts.optimize_fixed_origin:
                 form["preserveFirstStop"] = "true"
             if opts.optimize_fixed_destination:
@@ -129,53 +139,46 @@ class EsriRoutingConnector(_EsriBase):
             raise unknown_error(resp.status, None, "ESRI Routing returned non-JSON body")
         features = jlist(jget(jget(raw, "routes"), "features")) or []
         if not features:
-            raise unknown_error(resp.status, raw, "ESRI Routing returned no routes")
+            # Esri's OBSERVED no-route path is the in-body error envelope (an
+            # unlocated stop), not an empty featureset. This branch is a shape Esri
+            # has not been seen to produce — classify it with the same code as the
+            # other five so a consumer has one "provider answered, no route" case.
+            raise classified_error(
+                ProviderCode.NO_ROUTE, resp.status, raw, "ESRI Routing returned no routes"
+            )
         feature = features[0]
         attrs = jget(feature, "attributes") or {}
 
-        # Totals come from the directions summary, which is travel-mode-independent
-        # (totalLength in meters via directionsLengthUnits=esriNAUMeters, totalTime
-        # in minutes). The route feature's Total_* attributes are named after the
-        # active impedance — driving reports Total_TravelTime, walking reports
-        # Total_WalkTime, and neither Total_Length nor Total_Time is emitted at all
-        # — so reading them directly silently yields 0 for any non-driving mode.
-        # Fall back to the attributes only when the summary is absent (verified live
-        # 2026-07-21).
-        summary = _esri_directions_summary(raw)
-        summary_len = summary.get("totalLength") if summary is not None else None
-        summary_time = summary.get("totalTime") if summary is not None else None
-        if summary_len is not None:
-            total_dist = jnum(summary_len)
-        elif attrs.get("Total_Length") is not None:
-            total_dist = jnum(attrs.get("Total_Length"))
-        elif attrs.get("Total_Kilometers") is not None:
-            total_dist = jnum(attrs.get("Total_Kilometers")) * 1000
+        # Legs and totals share one source, so they always reconcile.
+        cumulative = _esri_cumulative_stop_costs(jlist(jget(jget(raw, "stops"), "features")) or [])
+        if cumulative is not None:
+            total_dist, total_dur, legs = cumulative
         else:
-            total_dist = 0.0
-        if summary_time is not None:
-            total_min = jnum(summary_time)
-        elif attrs.get("Total_Time") is not None:
-            total_min = jnum(attrs.get("Total_Time"))
-        elif attrs.get("Total_TravelTime") is not None:
-            total_min = jnum(attrs.get("Total_TravelTime"))
-        elif attrs.get("Total_WalkTime") is not None:
-            total_min = jnum(attrs.get("Total_WalkTime"))
-        else:
-            total_min = 0.0
-        total_dur = total_min * _MIN_TO_SEC
-
-        legs = _esri_reconstruct_legs(jlist(jget(raw, "directions")) or [], len(wps), total_dist, total_dur)
+            # A stop that failed to locate carries no cumulative cost, and a service
+            # configured without the accumulate attributes returns none. The route's
+            # own totals are named after the active impedance.
+            total_dist = _esri_route_total_distance_meters(attrs)
+            total_dur = _esri_route_total_duration_seconds(attrs)
+            legs = _esri_even_split_legs(len(wps), total_dist, total_dur)
         pts: List[LatLng] = []
         for path in (jget(jget(feature, "geometry"), "paths") or []):
             for point in path:
                 if isinstance(point, list) and len(point) >= 2:
                     pts.append(LatLng(point[1], point[0]))
+        # Optimized routes only. Stops are always fetched now, so without this gate an
+        # unoptimized route would report a useless identity permutation.
+        waypoint_order = (
+            _esri_waypoint_order(jlist(jget(jget(raw, "stops"), "features")) or [], len(wps))
+            if opts.optimize
+            else None
+        )
+
         return RoutingResult(
             legs=legs,
             total_distance_meters=total_dist,
             total_duration_seconds=total_dur,
             polyline=encode_polyline(pts),
-            waypoint_order=_esri_waypoint_order(jlist(jget(jget(raw, "stops"), "features")) or [], len(wps)),
+            waypoint_order=waypoint_order,
             raw=raw,
         )
 
@@ -277,11 +280,16 @@ class EsriGeocodingConnector(_EsriBase):
         cands: List[GeocodeCandidate] = []
         for ci in jlist(jget(raw, "candidates")) or []:
             loc = jget(ci, "location") or {}
+            # Skip a candidate without real coordinates rather than emitting a
+            # fabricated (0,0) "Null Island" position.
+            y, x = jnum_opt(loc.get("y")), jnum_opt(loc.get("x"))
+            if y is None or x is None:
+                continue
             viewport = None
             ext = jget(ci, "extent")
             if isinstance(ext, dict):
                 viewport = Viewport(LatLng(jnum(ext.get("ymin")), jnum(ext.get("xmin"))), LatLng(jnum(ext.get("ymax")), jnum(ext.get("xmax"))))
-            cands.append(GeocodeCandidate(formatted_address=jstr(jget(ci, "address")), location=LatLng(jnum(loc.get("y")), jnum(loc.get("x"))), viewport=viewport))
+            cands.append(GeocodeCandidate(formatted_address=jstr(jget(ci, "address")), location=LatLng(y, x), viewport=viewport))
         return GeocodeResult(candidates=cands, raw=raw)
 
     def reverse_geocode(self, opts: ReverseGeocodeOptions) -> ReverseGeocodeResult:
@@ -297,7 +305,11 @@ class EsriGeocodingConnector(_EsriBase):
         formatted = jstr(jget(addr, "LongLabel")) or jstr(jget(addr, "Match_addr"))
         if not formatted:
             return ReverseGeocodeResult(candidates=[], raw=raw)
-        return ReverseGeocodeResult(candidates=[GeocodeCandidate(formatted_address=formatted, location=LatLng(jnum(jget(loc, "y")), jnum(jget(loc, "x"))))], raw=raw)
+        # No coordinates means no usable candidate — never a fabricated (0,0).
+        y, x = jnum_opt(jget(loc, "y")), jnum_opt(jget(loc, "x"))
+        if y is None or x is None:
+            return ReverseGeocodeResult(candidates=[], raw=raw)
+        return ReverseGeocodeResult(candidates=[GeocodeCandidate(formatted_address=formatted, location=LatLng(y, x))], raw=raw)
 
     def autocomplete(self, opts: AutocompleteOptions) -> AutocompleteResult:
         token = resolve_esri_bearer_token(self.cfg)
@@ -305,6 +317,10 @@ class EsriGeocodingConnector(_EsriBase):
         if opts.location is not None:
             assert_finite(opts.location, "ESRI autocomplete location")
             query["location"] = to_lng_lat_string(opts.location)
+        # `country_filter` → `countryCode` (comma-joined alpha-2; ESRI uses alpha-2
+        # directly), same translation as forward geocode.
+        if opts.country_filter:
+            query["countryCode"] = ",".join(opts.country_filter)
         raw = self._dispatch_get(_SUGGEST_URL, query, opts.passthrough, "ESRI autocomplete failed")
         preds = [AutocompletePrediction(description=jstr(jget(s, "text")), place_id=jstr(jget(s, "magicKey")) or None) for s in (jlist(jget(raw, "suggestions")) or [])]
         return AutocompleteResult(predictions=preds, raw=raw)
@@ -322,6 +338,64 @@ class EsriGeocodingConnector(_EsriBase):
         if jget(raw, "error") is not None:
             raise _esri_body_error(resp.status, raw)
         return raw
+
+    def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
+        """Resolve an Esri ``magicKey`` (from ``autocomplete()``) to a full candidate.
+
+        ``GET .../findAddressCandidates?magicKey=`` — the same endpoint as forward
+        geocode, so the same normalizer applies.
+
+        **Live-verified that ``magicKey`` alone is sufficient.** Esri's docs pair it
+        with the original ``SingleLine`` text, and the plan here originally did too;
+        probing showed the key on its own resolves to the byte-identical candidate.
+        That is why ``place_id`` needs no companion field — our ``place_id`` IS the
+        magicKey.
+        """
+        query = {
+            "f": "json",
+            "token": resolve_esri_bearer_token(self.cfg),
+            "magicKey": opts.place_id,
+            "outFields": "*",
+        }
+        if opts.language:
+            query["langCode"] = opts.language
+
+        raw = self._dispatch_get(_GEOCODE_URL, query, opts.passthrough, "ESRI place details failed")
+
+        cands = jlist(jget(raw, "candidates")) or []
+        first = cands[0] if cands else None
+        if first is None:
+            raise classified_error(
+                ProviderCode.NO_ROUTE, None, raw, "ESRI Place Details returned no candidate"
+            )
+
+        loc = jget(first, "location") or {}
+        y, x = jnum_opt(loc.get("y")), jnum_opt(loc.get("x"))
+        if y is None or x is None:
+            raise classified_error(
+                ProviderCode.NO_ROUTE, None, raw, "ESRI Place Details returned no location"
+            )
+
+        viewport = None
+        ext = jget(first, "extent")
+        if isinstance(ext, dict):
+            corners = [
+                jnum_opt(ext.get("ymin")), jnum_opt(ext.get("xmin")),
+                jnum_opt(ext.get("ymax")), jnum_opt(ext.get("xmax")),
+            ]
+            if all(c is not None for c in corners):
+                ymin, xmin, ymax, xmax = corners
+                viewport = Viewport(LatLng(ymin, xmin), LatLng(ymax, xmax))
+
+        candidate = GeocodeCandidate(
+            formatted_address=jstr(jget(first, "address")),
+            location=LatLng(y, x),
+            viewport=viewport,
+        )
+
+        # Esri returns only an address — there is no separate display name to
+        # surface, so `name` stays None even when requested.
+        return PlaceDetailsResult(candidate=candidate, raw=raw)
 
 
 class EsriIsochroneConnector(_EsriBase):
@@ -475,47 +549,112 @@ def _esri_stringify(v: Any) -> str:
     return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
 
 
-def _esri_directions_summary(raw) -> Optional[dict]:
-    """Return the route-level directions summary (travel-mode-independent totals)
-    when present. ESRI returns ``directions`` as a list whose first entry carries
-    the ``summary`` object."""
-    dirs = jlist(jget(raw, "directions")) or []
-    if dirs and isinstance(dirs[0], dict):
-        s = jget(dirs[0], "summary")
-        if isinstance(s, dict):
-            return s
-    return None
+def _esri_cumulative_stop_costs(features: List[Any]):
+    """Per-leg distances/durations and the route totals, from the per-stop cumulative costs.
 
+    ``Cumul_<attribute>`` is the cost from the origin *to and including* that stop, so a
+    leg is the difference between consecutive stops and the total is the last value —
+    which is why legs always sum to the totals here.
 
-def _esri_reconstruct_legs(directions, num_waypoints, total_dist, total_dur) -> List[RoutingLeg]:
-    num_legs = max(1, num_waypoints - 1)
+    Two things are easy to get wrong:
 
-    def even_split():
-        return [RoutingLeg(total_dist / num_legs, total_dur / num_legs) for _ in range(num_legs)]
+    1. Stops arrive in INPUT order while cumulative costs run along the route, so they
+       must be sorted by ``Sequence``. Without it an optimized route yields negative legs.
+    2. The field name carries the active impedance — ``Cumul_TravelTime`` driving,
+       ``Cumul_WalkTime`` walking — so the keys are discovered, not hardcoded.
 
-    if not directions or not (jlist(jget(directions[0], "features")) or []):
-        return even_split()
-    steps = jlist(jget(directions[0], "features")) or []
+    Returns ``None`` when the values are unusable: fewer than two stops, a stop that
+    failed to locate (``Status != 0`` carries no cumulative cost), a non-monotonic
+    sequence, or a service configured without the accumulate attributes.
+    """
+    if len(features) < 2:
+        return None
+
+    rows = []
+    for f in features:
+        a = jget(f, "attributes") or {}
+        if jnum_opt(a.get("Sequence")) is None:
+            return None
+        rows.append(a)
+
+    # Sequence is 1-based; sorting by it puts the stops in route order.
+    rows.sort(key=lambda a: jnum(a.get("Sequence")))
+
+    cumul_keys = [k for k in rows[0] if isinstance(k, str) and k.startswith("Cumul_")]
+    distance_key = next((k for k in cumul_keys if "Kilometers" in k or k.endswith("Miles")), None)
+    time_key = next((k for k in cumul_keys if k != distance_key), None)
+    if distance_key is None or time_key is None:
+        return None
+
+    to_meters = _METERS_PER_MILE if distance_key.endswith("Miles") else _KM_TO_M
+
+    distances: List[float] = []
+    times: List[float] = []
+    for a in rows:
+        d = jnum_opt(a.get(distance_key))
+        t = jnum_opt(a.get(time_key))
+        if d is None or t is None:
+            return None
+        # Not located / not reached: no cumulative cost, so later diffs are wrong.
+        status = jnum_opt(a.get("Status"))
+        if status is not None and status != 0:
+            return None
+        distances.append(d * to_meters)
+        times.append(t * _MIN_TO_SEC)
+
     legs: List[RoutingLeg] = []
-    acc_dist = acc_time = 0.0
-    passed_first = False
-    for step in steps:
-        a = jget(step, "attributes") or {}
-        if jstr(a.get("maneuverType")) == _STOP_MANEUVER:
-            if not passed_first:
-                passed_first = True
-                acc_dist = acc_time = 0.0
-                continue
-            legs.append(RoutingLeg(acc_dist, acc_time * _MIN_TO_SEC))
-            acc_dist = acc_time = 0.0
+    for i in range(1, len(rows)):
+        dm = distances[i] - distances[i - 1]
+        ds = times[i] - times[i - 1]
+        # Cumulative costs never decrease, so a negative diff means wrong order.
+        if dm < 0 or ds < 0:
+            return None
+        legs.append(RoutingLeg(dm, ds))
+
+    return distances[-1], times[-1], legs
+
+
+def _esri_route_total_distance_meters(attrs: Any) -> float:
+    """The route's total distance in meters, matched by shape: the attribute is suffixed
+    with the active distance attribute and this service emits no ``Total_Length``."""
+    if jnum_opt(attrs.get("Total_Length")) is not None:
+        return jnum(attrs.get("Total_Length"))
+    if jnum_opt(attrs.get("Total_Kilometers")) is not None:
+        return jnum(attrs.get("Total_Kilometers")) * _KM_TO_M
+    if jnum_opt(attrs.get("Total_Miles")) is not None:
+        return jnum(attrs.get("Total_Miles")) * _METERS_PER_MILE
+    return 0.0
+
+
+def _esri_route_total_duration_seconds(attrs: Any) -> float:
+    """The route's total duration in seconds. Same shape-based match: any ``Total_*``
+    that is not a distance attribute is the time one, in minutes."""
+    if jnum_opt(attrs.get("Total_Time")) is not None:
+        return jnum(attrs.get("Total_Time")) * _MIN_TO_SEC
+    for key, value in attrs.items():
+        name = str(key)
+        if not name.startswith("Total_"):
             continue
-        if not passed_first:
+        if "Kilometers" in name or "Miles" in name or "Length" in name:
             continue
-        acc_dist += jnum(a.get("length"))
-        acc_time += jnum(a.get("time"))
-    if acc_dist > 0 or acc_time > 0:
-        legs.append(RoutingLeg(acc_dist, acc_time * _MIN_TO_SEC))
-    return legs or even_split()
+        if jnum_opt(value) is not None:
+            return jnum(value) * _MIN_TO_SEC
+    return 0.0
+
+
+def _esri_even_split_legs(waypoint_count: int, total_dist: float, total_dur: float) -> List[RoutingLeg]:
+    """Even split of the totals, used when per-stop cumulative costs are unavailable."""
+    num_legs = max(1, waypoint_count - 1)
+    return [RoutingLeg(total_dist / num_legs, total_dur / num_legs) for _ in range(num_legs)]
+
+
+def _esri_time_attribute_for(mode: Optional[TravelMode]) -> str:
+    """The time attribute to accumulate, which determines the ``Cumul_<attr>`` field name.
+
+    Must mirror :func:`_esri_travel_mode`: requesting an attribute the active impedance
+    does not use yields no cumulative field at all, silently.
+    """
+    return "WalkTime" if mode == TravelMode.WALKING else "TravelTime"
 
 
 def _esri_waypoint_order(stops: List[Any], total_stops: int) -> Optional[List[int]]:
@@ -527,15 +666,14 @@ def _esri_waypoint_order(stops: List[Any], total_stops: int) -> Optional[List[in
     (``order[Sequence - 1] = input_index``). Returns ``None`` when the sequence
     data is absent, incomplete, or malformed.
     """
-    if len(stops) != total_stops:
-        return None
-    order: List[int] = [-1] * total_stops
-    for input_idx, feature in enumerate(stops):
+    # Esri Sequence is 1-based; the shared helper expects 0-based visit
+    # positions. Non-integer values are forwarded as None so the helper rejects
+    # them (it also enforces length, range, and no-duplicates).
+    positions: List[Any] = []
+    for feature in stops:
         seq = jget(jget(feature, "attributes"), "Sequence")
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1 or seq > total_stops or order[seq - 1] != -1:
-            return None
-        order[seq - 1] = input_idx
-    return order
+        positions.append(seq - 1 if isinstance(seq, int) and not isinstance(seq, bool) else None)
+    return invert_waypoint_positions(positions, total_stops)
 
 
 def _esri_matrix_oid(key: Any) -> Optional[int]:
@@ -579,6 +717,20 @@ def _esri_body_error_code(body: Any) -> Optional[int]:
     return None
 
 
+def _esri_has_unlocated_stop(body: Any) -> bool:
+    """Whether an Esri error body names a stop it could not locate on the network.
+
+    Live-verified shape: HTTP 200 with
+    ``{"error": {"code": 400, "message": "Unable to complete operation.",
+    "details": ['Location "Location 1" in "Stops" is unlocated. …']}}``.
+    The ``details[]`` array is the only place the cause appears.
+    """
+    details = jlist(jget(jget(body, "error"), "details"))
+    if not details:
+        return False
+    return any(isinstance(d, str) and "unlocated" in d.lower() for d in details)
+
+
 def _esri_map_vendor_error(status: int, body: Any) -> ProviderCode:
     code = _esri_body_error_code(body)
     if status == 429 or code == 429:
@@ -587,7 +739,13 @@ def _esri_map_vendor_error(status: int, body: Any) -> ProviderCode:
         if code in (498, 499, 403):
             return ProviderCode.AUTH_FAILED
         if code in (400, 404):
-            return ProviderCode.INVALID_REQUEST
+            # Esri has no distinct code for "no route": an unroutable stop comes
+            # back as HTTP 200 with error.code: 400 and a details[] entry naming the
+            # stop as **unlocated** (live-verified). `unlocated` is Esri's own term
+            # for a stop it could not snap to the network, so matching it reads a
+            # stated condition rather than inferring one — the same bar the OSRM
+            # `profile not found` match already meets.
+            return ProviderCode.NO_ROUTE if _esri_has_unlocated_stop(body) else ProviderCode.INVALID_REQUEST
         if code == 500:
             return ProviderCode.PROVIDER_UNAVAILABLE
         return ProviderCode.UNKNOWN

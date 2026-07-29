@@ -68,10 +68,11 @@ python -c "import thinwrap.location"                 # offline import smoke
   Google precision-5 polyline. The four polyline utilities are locked.
 - **Per-connector locality.** Vendor error mapping + outlier translation live in
   `_<provider>.py` — never in `BaseConnector`. Keys forwarded verbatim.
-- **`ProviderCode`**: 6 canonical + 5 location-extended, byte-identical to the
+- **`ProviderCode`**: 6 canonical + 7 location-extended, byte-identical to the
   siblings, surfaced via `ConnectorError`; the raw `Retry-After` rides in
   `cause["retryAfter"]` (no top-level `retry_after_seconds`).
-- **OSRM** requires an explicit `base_url`, validated before any HTTP.
+- **OSRM** requires an explicit `base_url`, validated before any HTTP, at the top of
+  each operation rather than in the facade constructor.
 - **Python idioms:** synchronous API; a bring-your-own `Transport` protocol
   (default = stdlib `urllib`, never follows redirects); errors raised as
   `ConnectorError`.

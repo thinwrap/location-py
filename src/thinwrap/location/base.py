@@ -53,14 +53,38 @@ class BaseConnector:
             # including credential query params — in its exception message. Keep
             # only a redacted STRING.
             msg = redact_credentials(str(exc))
+            code = _classify_transport_failure(exc)
         # Raised OUTSIDE the except block on purpose: implicit exception chaining
         # only happens while an exception is being handled, so neither .__cause__
         # nor .__context__ ends up referencing the (URL-bearing) transport
         # exception. `from None` alone would still leave it on .__context__,
         # which Sentry/Rollbar walk regardless of __suppress_context__.
         raise ConnectorError(
-            ProviderCode.PROVIDER_UNAVAILABLE,
+            code,
             message=msg,
             provider_message=msg,
             cause=msg,
         )
+
+
+def _classify_transport_failure(exc: BaseException) -> ProviderCode:
+    """Separate a timeout from a generic transport outage.
+
+    A timeout is the one transport failure a caller acts on differently (back off
+    and retry vs. treat the provider as down), and the redacted message
+    deliberately hides the detail needed to tell them apart.
+
+    ``socket.timeout`` is an alias of :class:`TimeoutError` on Python 3.10+, and
+    ``urllib`` surfaces a read timeout as ``URLError(TimeoutError(...))`` — hence
+    the ``__cause__``/``reason`` walk. A BYO transport that raises something else
+    entirely still reports ``provider_unavailable``, exactly as before.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return ProviderCode.TIMEOUT
+        reason = getattr(current, "reason", None)
+        current = current.__cause__ or (reason if isinstance(reason, BaseException) else None)
+    return ProviderCode.PROVIDER_UNAVAILABLE

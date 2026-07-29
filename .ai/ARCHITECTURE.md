@@ -34,13 +34,20 @@ Routing(GoogleConfig(...))   →  Routing facade
    `_<provider>.py`. Shared helpers (`provider_error` Retry-After surfacing,
    `merge_passthrough`, coordinate/JSON helpers) are building blocks connectors
    call, never global interception.
-4. **`ProviderCode`** — 6 canonical + 5 location-extended, byte-identical string
+4. **`ProviderCode`** — 6 canonical + 7 location-extended, byte-identical string
    values. The raw `Retry-After` rides in `ConnectorError.cause["retryAfter"]`;
    parsed seconds are woven into `provider_message`. No `retry_after_seconds`.
-5. **OSRM self-host invariants.** `base_url` required (validated before any HTTP).
-   Pre-flight typed errors: `unsupported_field` (departure_time),
-   `unsupported_option` (avoid_* flags), `invalid_request` (illegal `/trip`
-   combo). Profile mismatch → `profile_not_configured`.
+5. **OSRM self-host invariants.** `base_url` required (validated by
+   `_validate_base_url` at the top of each operation, before any HTTP). It
+   enforces two rules: non-empty, and an `http://`/`https://` scheme — without one
+   the default transport raises `URLError("unsupported URL scheme")`, which
+   `BaseConnector` reports as `provider_unavailable` behind a redacted message, so
+   a config typo reads as an outage.
+   A **path prefix is allowed** (`https://host/osrm` behind a reverse proxy is
+   normal); trailing slashes are stripped so path concatenation cannot emit a
+   double slash. Pre-flight typed errors: `unsupported_field` (departure_time),
+   `unsupported_option` (avoid_* flags), `invalid_request` (illegal `/trip` combo,
+   bad `base_url`). Profile mismatch → `profile_not_configured`.
 6. **Async matrix outliers, transient within one `matrix` call.** HERE is always
    async (submit → poll → retrieve; validates the provider-returned
    `statusUrl`/`resultUrl` host is `*.hereapi.com` before attaching the key).

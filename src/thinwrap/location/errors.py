@@ -27,6 +27,24 @@ class ProviderCode(str, Enum):
     PROFILE_NOT_CONFIGURED = "profile_not_configured"
     MATRIX_POLLING_TIMEOUT = "matrix_polling_timeout"
 
+    #: The provider answered successfully but no route exists between the given
+    #: waypoints. Distinct from ``INVALID_REQUEST``: the request was well-formed,
+    #: so this is a business outcome to branch on rather than a bug to fix.
+    #:
+    #: The vendors agree on nothing here — Google answers HTTP 200 with the
+    #: ``routes`` key absent, HERE 200 with ``routes: []`` plus a ``notices[]``
+    #: code, Mapbox ``code: "NoRoute"`` on either 200 or 422, OSRM the same codes
+    #: on a 400, TomTom a 400 with ``detailedError.code``, Esri a 200 with an
+    #: in-body ``error.code: 400`` whose ``details[]`` name an *unlocated* stop.
+    #:
+    #: In practice it means a waypoint could not be matched to the road network:
+    #: every provider tested routes Reykjavik->Oslo via ferry, so a genuinely
+    #: disconnected network is close to unreachable.
+    NO_ROUTE = "no_route"
+
+    #: The request exceeded the transport's timeout before any response arrived.
+    TIMEOUT = "timeout"
+
 
 class ConnectorError(Exception):
     """The single typed error every operation can raise.

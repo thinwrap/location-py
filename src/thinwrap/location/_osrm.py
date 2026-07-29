@@ -4,14 +4,16 @@ baseUrl required; pre-flight validation; in-body status codes."""
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence, Tuple
 
 from ._jsonpath import jget, jlist, jnum, jstr
+from ._route_completeness import assert_route_has_legs
 from ._util import decode_json, ok_status
+from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import OsrmConfig
 from .coordinate import join_coords
-from .enums import TravelMode
+from .enums import PolylineQuality, TravelMode
 from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, unknown_error
 from .latlng import LatLng
 from .matrix import MatrixCell, MatrixOptions, MatrixResult
@@ -21,13 +23,36 @@ from .routing import RoutingLeg, RoutingOptions, RoutingResult
 _PROFILE_NOT_FOUND = re.compile(r"profile\s+not\s+found", re.IGNORECASE)
 
 
-def _validate_base_url(base_url: str) -> None:
+def _validate_base_url(base_url: str) -> str:
+    """Validate and normalize an OSRM base URL, returning the value to build on.
+
+    OSRM is the only provider requiring an explicit base URL and shipping zero
+    auth, so there is no default to fall back to (the public demo server is
+    deliberately not one).
+
+    Two checks: non-empty, and an ``http://`` or ``https://`` scheme. Without a
+    scheme the default transport raises ``URLError("unsupported URL scheme")``,
+    which ``BaseConnector`` reports as ``provider_unavailable`` behind a redacted
+    message — making a bare host in config look exactly like the server being
+    down. Checking here makes it an ``INVALID_REQUEST`` that names the config.
+
+    A path prefix is explicitly ALLOWED (hosting OSRM at ``https://host/osrm``
+    behind a reverse proxy is a normal deployment); trailing slashes are stripped
+    so the caller's ``f"{base_url}/route/v1/..."`` cannot produce a double slash.
+    """
     if not base_url:
         raise ConnectorError(
             ProviderCode.INVALID_REQUEST,
             message="OSRM connector requires explicit baseUrl. The public demo server is not used as a default.",
             provider_message="baseUrl is required for OSRM",
         )
+    if not base_url.lower().startswith(("http://", "https://")):
+        raise ConnectorError(
+            ProviderCode.INVALID_REQUEST,
+            message=f"OSRM baseUrl must start with http:// or https:// (got: {base_url})",
+            provider_message="OSRM baseUrl must start with http:// or https://",
+        )
+    return base_url.rstrip("/")
 
 
 def _osrm_profile(m: TravelMode) -> str:
@@ -44,8 +69,8 @@ class OsrmRoutingConnector(BaseConnector):
         self.cfg = config
 
     def route(self, opts: RoutingOptions) -> RoutingResult:
-        _validate_base_url(self.cfg.base_url)
-        _validate_routing_compat(opts)
+        base_url = _validate_base_url(self.cfg.base_url)
+        _validate_routing_compat(opts, self.cfg.supported_exclude_classes)
         wps = list(opts.waypoints)
         if len(wps) < 2:
             raise invalid_request("OSRM Routing requires at least two waypoints")
@@ -54,9 +79,22 @@ class OsrmRoutingConnector(BaseConnector):
         profile = _osrm_profile(opts.travel_mode)
         coords = join_coords(wps, "lnglat", ";")
         endpoint = "trip" if use_trip else "route"
-        url = f"{self.cfg.base_url}/{endpoint}/v1/{profile}/{coords}"
+        url = f"{base_url}/{endpoint}/v1/{profile}/{coords}"
 
-        base_query = {"overview": "full", "geometries": "polyline", "steps": "true", "annotations": "duration,distance"}
+        # steps and annotations are deliberately NOT sent on /route: nothing in
+        # RoutingResult reads them, and leg distance/duration are present regardless
+        # of annotations. (The Table service is different — it forces
+        # annotations=duration,distance because that IS what populates the cells.)
+        base_query = {
+            "overview": "full" if opts.polyline_quality == PolylineQuality.DETAILED else "simplified",
+            "geometries": "polyline",
+        }
+
+        # Only classes the operator declared AND the caller asked for; validation
+        # has already rejected any undeclared request.
+        excludes = [cls for _, cls, requested in _osrm_avoid_flags(opts) if requested]
+        if excludes:
+            base_query["exclude"] = ",".join(excludes)
         if use_trip:
             source = "first" if opts.optimize_fixed_origin else "any"
             destination = "last" if opts.optimize_fixed_destination else "any"
@@ -83,25 +121,27 @@ class OsrmRoutingConnector(BaseConnector):
         if not routes and isinstance(raw, dict):
             routes = raw.get("trips")
         if jstr(raw.get("code") if isinstance(raw, dict) else "") != "Ok" or not routes:
-            raise _osrm_route_in_body_error(raw, use_trip)
+            raise _osrm_route_in_body_error(raw, use_trip, resp.status)
         route = routes[0]
 
         legs = [RoutingLeg(jnum(l.get("distance")), jnum(l.get("duration"))) for l in (route.get("legs") or [])]
 
+        assert_route_has_legs(len(legs), len(wps), 'OSRM routing', raw)
+
         waypoint_order = None
         wps_out = raw.get("waypoints")
         if use_trip and isinstance(wps_out, list):
-            n = len(wps_out)
-            order = [0] * n
-            valid = True
-            for input_idx, wp in enumerate(wps_out):
-                pos = jget(wp, "waypoint_index")
-                if isinstance(pos, bool) or not isinstance(pos, (int, float)) or pos < 0 or pos >= n:
-                    valid = False
-                    break
-                order[int(pos)] = input_idx
-            if valid:
-                waypoint_order = order
+            # Canonical waypoint_order = full visiting sequence of INPUT indices
+            # (origin/destination inclusive). OSRM /trip returns waypoints[] in INPUT
+            # order, where each waypoint_index is the position that input
+            # waypoint occupies in the optimized trip — i.e. the INVERSE of the
+            # canonical. Invert it, validated against the INPUT waypoint count so
+            # a truncated or duplicate-index waypoints[] omits the ordering
+            # instead of yielding a permutation that silently drops or repeats a
+            # waypoint.
+            waypoint_order = invert_waypoint_positions(
+                [jget(wp, "waypoint_index") for wp in wps_out], len(opts.waypoints)
+            )
 
         return RoutingResult(
             legs=legs,
@@ -119,7 +159,7 @@ class OsrmMatrixConnector(BaseConnector):
         self.cfg = config
 
     def matrix(self, opts: MatrixOptions) -> MatrixResult:
-        _validate_base_url(self.cfg.base_url)
+        base_url = _validate_base_url(self.cfg.base_url)
         if opts.departure_time is not None:
             raise ConnectorError(ProviderCode.UNSUPPORTED_FIELD, message="OSRM does not support departureTime", provider_message="OSRM does not support departureTime")
         if opts.avoid_tolls:
@@ -131,7 +171,7 @@ class OsrmMatrixConnector(BaseConnector):
         coords = join_coords(list(opts.origins) + list(opts.destinations), "lnglat", ";")
         sources = ";".join(str(i) for i in range(len(opts.origins)))
         dests = ";".join(str(i + len(opts.origins)) for i in range(len(opts.destinations)))
-        url = f"{self.cfg.base_url}/table/v1/{profile}/{coords}"
+        url = f"{base_url}/table/v1/{profile}/{coords}"
         # `annotations` is a connector default set BEFORE the merge so a consumer's
         # passthrough.query can override it (setting it after the merge silently
         # ignored the override).
@@ -164,30 +204,82 @@ class OsrmMatrixConnector(BaseConnector):
 
 # ---- shared osrm helpers ----
 
-def _validate_routing_compat(opts: RoutingOptions) -> None:
+def _osrm_avoid_flags(opts: RoutingOptions) -> List[Tuple[str, str, bool]]:
+    """The normalized avoid-flag -> OSRM ``exclude`` class mapping, paired with
+    whether the caller requested it. Ordered, so the first unsupported flag is the
+    one reported."""
+    return [
+        ("avoid_tolls", "toll", opts.avoid_tolls),
+        ("avoid_ferries", "ferry", opts.avoid_ferries),
+        ("avoid_highways", "motorway", opts.avoid_highways),
+    ]
+
+
+def _validate_routing_compat(opts: RoutingOptions, supported: Sequence[str] = ()) -> None:
     if opts.departure_time is not None:
         raise ConnectorError(ProviderCode.UNSUPPORTED_FIELD, message="OSRM does not support departureTime", provider_message="OSRM does not support departureTime")
-    if opts.avoid_tolls:
-        raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message="OSRM does not support avoidTolls", provider_message="avoidTolls is not supported by OSRM")
-    if opts.avoid_ferries:
-        raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message="OSRM does not support avoidFerries", provider_message="avoidFerries is not supported by OSRM")
-    if opts.avoid_highways:
-        raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message="OSRM does not support avoidHighways", provider_message="avoidHighways is not supported by OSRM")
-    # NOTE: the previous "invalid /trip combo" preflight is gone. It rejected
-    # source=any/destination=any/roundtrip=false, but the query builder no longer
-    # emits that combo — a plain optimize maps to source=first/destination=last
-    # (open route, endpoints kept, middle reordered), which OSRM accepts.
+
+    # Whether an avoid-flag works depends on the OPERATOR'S build, not on OSRM:
+    # exclude=toll is rejected as InvalidValue by the public demo build and honoured
+    # by a self-hosted instance with the class compiled in (verified live — it
+    # genuinely rerouted). So the capability is declared in config, and anything not
+    # declared is still rejected up front rather than sent and bounced with an
+    # opaque vendor error.
+    for flag, exclude_class, requested in _osrm_avoid_flags(opts):
+        if requested and exclude_class not in supported:
+            msg = (
+                f"{flag} requires an OSRM build with the '{exclude_class}' exclude "
+                "class compiled in; declare it via OsrmConfig.supported_exclude_classes"
+            )
+            raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message=msg, provider_message=msg)
 
 
-def _osrm_map_vendor_error(status: int) -> ProviderCode:
+def _osrm_classify_envelope_code(code: str, message: str, use_trip: bool) -> Optional[ProviderCode]:
+    """Classify an OSRM envelope ``code``, or None when it is not one this
+    connector recognizes (so the caller falls back to HTTP-status mapping).
+
+    Shared by both error paths because OSRM does not distinguish them: these codes
+    arrive with a **4xx** in practice (live-verified on both the public demo build
+    and a self-hosted instance — NoSegment, InvalidOptions and InvalidValue all came
+    back as 400), and the same code on a 200 means the same thing.
+
+    ``NoRoute`` / ``NoSegment`` / ``NoTrips`` are ``NO_ROUTE``: the request was
+    well-formed and the server answered, there simply is no connecting route (or no
+    road near a coordinate to snap to). A ``NoRoute`` whose message states a missing
+    profile is ``PROFILE_NOT_CONFIGURED`` instead — never inferred from a bare one.
+    """
+    if code in ("NoRoute", "NoSegment"):
+        if message and _PROFILE_NOT_FOUND.search(message):
+            return ProviderCode.PROFILE_NOT_CONFIGURED
+        return ProviderCode.NO_ROUTE
+    if code == "NoTrips":
+        # A /trip-endpoint outcome. On a /route dispatch it should never occur, so
+        # an unexpected one stays unclassified.
+        return ProviderCode.NO_ROUTE if use_trip else None
+    if code in ("InvalidQuery", "InvalidOptions", "InvalidValue", "TooBig"):
+        return ProviderCode.INVALID_REQUEST
+    return None
+
+
+def _osrm_map_vendor_error(status: int, body: Any = None, use_trip: bool = False) -> ProviderCode:
+    # Proxy-layer statuses win: a 401/429 from a reverse proxy has no OSRM envelope.
     if status in (401, 403):
         return ProviderCode.AUTH_FAILED
     if status == 429:
         return ProviderCode.RATE_LIMITED
-    if status in (400, 404):
-        return ProviderCode.INVALID_REQUEST
     if 500 <= status < 600:
         return ProviderCode.PROVIDER_UNAVAILABLE
+
+    # OSRM serves EVERY non-Ok envelope code with a 4xx, so the envelope code — not
+    # the status — distinguishes "no route exists" from "your request was wrong".
+    classified = _osrm_classify_envelope_code(
+        jstr(jget(body, "code")), jstr(jget(body, "message")), use_trip
+    )
+    if classified is not None:
+        return classified
+
+    if status in (400, 404):
+        return ProviderCode.INVALID_REQUEST
     return ProviderCode.UNKNOWN
 
 
@@ -197,22 +289,38 @@ def _osrm_error_message(body: Any) -> str:
 
 def _osrm_http_error(status: int, headers, data: bytes) -> ConnectorError:
     raw = decode_json(data)
-    return provider_error(status, headers, raw, _osrm_map_vendor_error(status), _osrm_error_message(raw))
+    # use_trip is not threaded here: the /trip-only NoTrips code stays unclassified
+    # on this shared path, which is the conservative choice for a helper also used
+    # by the Table service.
+    return provider_error(status, headers, raw, _osrm_map_vendor_error(status, raw), _osrm_error_message(raw))
 
 
-def _osrm_route_in_body_error(body: Any, use_trip: bool) -> ConnectorError:
+def _osrm_route_in_body_error(body: Any, use_trip: bool, status_code: int) -> ConnectorError:
+    """Map a 2xx OSRM envelope to a typed error.
+
+    Reached when the envelope code is not ``Ok``, or when ``routes``/``trips`` came
+    back empty.
+
+    An ``Ok`` envelope with an empty ``routes[]`` is ``NO_ROUTE``, not ``UNKNOWN``:
+    the envelope says the request was fine and the server answered, there is simply
+    nothing to return. Reported as unknown it produced the message "OSRM returned
+    code: Ok", which reads like a success and gave a consumer nothing to branch on —
+    while Google's empty ``routes[]`` has always mapped to ``no_route``.
+
+    ``status_code`` is the real HTTP status rather than ``None``: this path is only
+    reachable on a 2xx, and nulling it made an answered request look like a
+    transport failure.
+    """
     code = jstr(jget(body, "code"))
     message = jstr(jget(body, "message"))
-    if code in ("NoRoute", "NoSegment"):
-        pc = ProviderCode.PROFILE_NOT_CONFIGURED if (message and _PROFILE_NOT_FOUND.search(message)) else ProviderCode.INVALID_REQUEST
-    elif code in ("InvalidQuery", "InvalidOptions"):
-        pc = ProviderCode.INVALID_REQUEST
-    elif code == "NoTrips":
-        pc = ProviderCode.INVALID_REQUEST if use_trip else ProviderCode.UNKNOWN
-    else:
-        pc = ProviderCode.UNKNOWN
+    if code == "Ok":
+        noun = "trips" if use_trip else "routes"
+        return classified_error(
+            ProviderCode.NO_ROUTE, status_code, body, f"OSRM returned no {noun} with envelope code Ok"
+        )
+    pc = _osrm_classify_envelope_code(code, message, use_trip) or ProviderCode.UNKNOWN
     pm = message or f"OSRM returned code: {code or 'unknown'}"
-    return classified_error(pc, None, body, pm)
+    return classified_error(pc, status_code, body, pm)
 
 
 def _osrm_matrix_in_body_error(body: Any) -> ConnectorError:

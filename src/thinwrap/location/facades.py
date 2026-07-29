@@ -19,6 +19,8 @@ from .geocoding import (
     AutocompleteResult,
     GeocodeOptions,
     GeocodeResult,
+    PlaceDetailsOptions,
+    PlaceDetailsResult,
     ReverseGeocodeOptions,
     ReverseGeocodeResult,
 )
@@ -101,6 +103,19 @@ class Geocoding:
 
     def geocode(self, options: GeocodeOptions) -> GeocodeResult:
         return self._c.geocode(options)
+
+    def place_details(self, options: PlaceDetailsOptions) -> PlaceDetailsResult:
+        """Resolve a ``place_id`` from ``autocomplete()`` into a full candidate.
+
+        All five geocoding providers implement it. There is no capability check
+        because every connector this facade can build is one of the five above —
+        unlike the TS sibling, whose facade can have a custom connector swapped in.
+
+        For Mapbox, set ``options.session_token`` to the same value used for the
+        preceding ``autocomplete()`` call: Search Box bills per session, so a matching
+        token makes suggest+retrieve one billable session instead of two.
+        """
+        return self._c.place_details(options)
 
     def reverse_geocode(self, options: ReverseGeocodeOptions) -> ReverseGeocodeResult:
         return self._c.reverse_geocode(options)

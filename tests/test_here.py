@@ -134,7 +134,8 @@ def test_geocode_unmapped_country():
 def test_autocomplete():
     fake = FakeTransport(resp(200, '{"items":[{"title":"New York, NY","id":"here:abc"}]}'))
     g = Geocoding(HereConfig("k"), transport=fake)
-    res = g.autocomplete(AutocompleteOptions(input="New"))
+    # Autosuggest mandates a search context; incidental to what this asserts.
+    res = g.autocomplete(AutocompleteOptions(input="New", location=LatLng(40.7128, -74.006)))
     assert res.predictions[0].description == "New York, NY" and res.predictions[0].place_id == "here:abc"
 
 

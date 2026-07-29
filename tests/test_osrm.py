@@ -46,7 +46,7 @@ def test_preflight(opts_kwargs, want):
 def test_plain_optimize_remaps_to_first_last():
     # Plain optimize would be source=any/destination=any/roundtrip=false — the
     # combo OSRM rejects with HTTP 400. It must be remapped to first/last.
-    t = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"_p~iF~ps|U","legs":[],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":1}]}'))
+    t = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"_p~iF~ps|U","legs":[{"distance":5,"duration":6}],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":1}]}'))
     r = Routing(OsrmConfig("http://x"), transport=t)
     r.route(RoutingOptions(waypoints=TWO, optimize=True))
     assert qget(t.last, "source") == "first"
@@ -56,7 +56,7 @@ def test_plain_optimize_remaps_to_first_last():
 
 def test_trip_waypoint_order():
     # OSRM Trip service returns route objects under `trips`, not `routes`.
-    fake = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"_p~iF~ps|U","legs":[],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":2},{"waypoint_index":1}]}'))
+    fake = FakeTransport(resp(200, '{"code":"Ok","trips":[{"geometry":"_p~iF~ps|U","legs":[{"distance":5,"duration":6}],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":2},{"waypoint_index":1}]}'))
     r = Routing(OsrmConfig("http://x"), transport=fake)
     res = r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], is_round_trip=True))
     assert res.waypoint_order == [0, 2, 1]
@@ -68,12 +68,19 @@ def test_in_body_error():
     r = Routing(OsrmConfig("http://x"), transport=fake)
     with pytest.raises(ConnectorError) as ei:
         r.route(RoutingOptions(waypoints=TWO))
-    assert ei.value.provider_code == ProviderCode.PROFILE_NOT_CONFIGURED and ei.value.status_code is None
+    # The in-body path is only reachable on a 2xx, so it reports the REAL status
+    # instead of None. Nulling it made an answered request look like a transport
+    # failure, and a consumer distinguishing the two had to read the
+    # deliberately-sanitized cause.
+    assert ei.value.provider_code == ProviderCode.PROFILE_NOT_CONFIGURED and ei.value.status_code == 200
 
+    # A generic NoRoute is no_route: the request was well-formed and OSRM
+    # answered; there is simply no connecting route. A missing profile is never
+    # inferred from a bare NoRoute — it must be stated in the message (above).
     fake2 = FakeTransport(resp(200, '{"code":"NoRoute","message":"no route"}'))
     with pytest.raises(ConnectorError) as ei2:
         Routing(OsrmConfig("http://x"), transport=fake2).route(RoutingOptions(waypoints=TWO))
-    assert ei2.value.provider_code == ProviderCode.INVALID_REQUEST
+    assert ei2.value.provider_code == ProviderCode.NO_ROUTE
 
 
 def test_matrix():
@@ -99,3 +106,21 @@ def test_matrix_dimension_mismatch():
     with pytest.raises(ConnectorError) as ei:
         m.matrix(MatrixOptions(origins=[LatLng(1, 1), LatLng(2, 2)], destinations=[LatLng(3, 3), LatLng(4, 4)]))
     assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"code":"Ok","routes":[]}', '{"code":"Ok","routes":[],"trips":[]}'],
+)
+def test_route_ok_with_empty_routes_is_no_route(body):
+    # An answered request with nothing to return. Unclassified it fell through to
+    # UNKNOWN with the message "OSRM returned code: Ok", which reads like a
+    # success — so a consumer branching on no_route had to keep a status heuristic
+    # beside it.
+    fake = FakeTransport(resp(200, body))
+    with pytest.raises(ConnectorError) as ei:
+        Routing(OsrmConfig(base_url="http://localhost:5000"), transport=fake).route(RoutingOptions(waypoints=TWO))
+    assert ei.value.provider_code == ProviderCode.NO_ROUTE
+    # The real status, not None — this path is only reachable on a 2xx.
+    assert ei.value.status_code == 200
+    assert "no routes" in ei.value.provider_message

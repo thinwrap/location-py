@@ -3,23 +3,30 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import uuid
 from typing import Any, List, Optional
 
-from ._jsonpath import jget, jlist, jnum, jstr
+from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
+from ._route_completeness import assert_route_has_legs
 from ._util import decode_json, iso_string, ok_status
+from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import MapboxConfig
 from .coordinate import assert_finite, fmt_coord, join_coords
-from .enums import IsochroneType, TravelMode
+from .enums import IsochroneType, PlaceDetailsInclude, PolylineQuality, TravelMode
 from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, unknown_error
 from .geocoding import (
     AutocompleteOptions,
     AutocompletePrediction,
     AutocompleteResult,
+    AutocompleteStructuredFormat,
     GeocodeCandidate,
     GeocodeOptions,
     GeocodeResult,
+    PlaceDetailsOptions,
+    PlaceDetailsResult,
     ReverseGeocodeOptions,
     ReverseGeocodeResult,
     Viewport,
@@ -37,6 +44,7 @@ _MATRIX_URL = "https://api.mapbox.com/directions-matrix/v1/mapbox"
 _GEOCODE_FORWARD_URL = "https://api.mapbox.com/search/geocode/v6/forward"
 _GEOCODE_REVERSE_URL = "https://api.mapbox.com/search/geocode/v6/reverse"
 _SEARCHBOX_URL = "https://api.mapbox.com/search/searchbox/v1/suggest"
+_RETRIEVE_URL = "https://api.mapbox.com/search/searchbox/v1/retrieve"
 _ISOCHRONE_URL = "https://api.mapbox.com/isochrone/v1/mapbox"
 
 
@@ -48,7 +56,9 @@ class MapboxRoutingConnector(BaseConnector):
     def route(self, opts: RoutingOptions) -> RoutingResult:
         use_optimized = opts.optimize or opts.optimize_fixed_origin or opts.optimize_fixed_destination or opts.is_round_trip
         profile = _mapbox_profile(opts.travel_mode)
-        resp = self._dispatch_optimized(opts, profile) if use_optimized else self._dispatch_directions(opts, profile)
+        resp, geometries = (
+            self._dispatch_optimized(opts, profile) if use_optimized else self._dispatch_directions(opts, profile)
+        )
 
         if not ok_status(resp.status):
             raise _mapbox_routing_vendor_error(resp.status, resp.headers, decode_json(resp.body))
@@ -62,27 +72,35 @@ class MapboxRoutingConnector(BaseConnector):
 
         routes = raw.get("routes") or raw.get("trips") or []
         if not routes:
-            raise unknown_error(resp.status, raw, "Mapbox returned no routes")
+            # A 2xx with an empty routes/trips array is Mapbox saying "nothing
+            # found", not a malformed response.
+            raise classified_error(
+                ProviderCode.NO_ROUTE, resp.status, raw, "Mapbox returned no routes"
+            )
         route = routes[0]
 
         legs = [RoutingLeg(jnum(l.get("distance")), jnum(l.get("duration"))) for l in (route.get("legs") or [])]
-        geometry = jstr(route.get("geometry"))
-        polyline = encode_polyline(_decode_mapbox_p6(geometry)) if geometry else ""
+        # Normalize the geometry to precision-5, decoding according to the
+        # `geometries` value actually sent — NOT the connector's polyline6
+        # default, which _passthrough.query may have overridden.
+        polyline = _normalize_mapbox_geometry(route.get("geometry"), geometries)
+
+        assert_route_has_legs(len(legs), len(opts.waypoints), 'Mapbox Routing', raw)
 
         waypoint_order = None
         wps = raw.get("waypoints")
         if use_optimized and isinstance(wps, list):
-            n = len(wps)
-            order = [0] * n
-            valid = True
-            for input_idx, wp in enumerate(wps):
-                pos = jget(wp, "waypoint_index")
-                if isinstance(pos, bool) or not isinstance(pos, (int, float)) or pos < 0 or pos >= n:
-                    valid = False
-                    break
-                order[int(pos)] = input_idx
-            if valid:
-                waypoint_order = order
+            # Canonical waypoint_order = full visiting sequence of INPUT indices
+            # (origin/destination inclusive). Mapbox returns waypoints[] in INPUT
+            # order, where each waypoint_index is the position that input
+            # waypoint occupies in the optimized trip — i.e. the INVERSE of the
+            # canonical. Invert it, validated against the INPUT waypoint count so
+            # a truncated or duplicate-index waypoints[] omits the ordering
+            # instead of yielding a permutation that silently drops or repeats a
+            # waypoint.
+            waypoint_order = invert_waypoint_positions(
+                [jget(wp, "waypoint_index") for wp in wps], len(opts.waypoints)
+            )
 
         return RoutingResult(
             legs=legs,
@@ -99,9 +117,7 @@ class MapboxRoutingConnector(BaseConnector):
         base_query = {
             "access_token": self.cfg.access_token,
             "geometries": "polyline6",
-            "overview": "full",
-            "steps": "true",
-            "annotations": "duration,distance",
+            "overview": _mapbox_overview(opts),
         }
         ex = _mapbox_excludes(opts)
         if ex:
@@ -109,7 +125,7 @@ class MapboxRoutingConnector(BaseConnector):
         if opts.departure_time:
             base_query["depart_at"] = iso_string(opts.departure_time)
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
-        return self.send_get(url, m_headers, m_query)
+        return self.send_get(url, m_headers, m_query), _mapbox_effective_geometries(m_query)
 
     def _dispatch_optimized(self, opts: RoutingOptions, profile: str):
         # GET /optimized-trips/v1 — the single-vehicle waypoint-order optimizer
@@ -124,9 +140,7 @@ class MapboxRoutingConnector(BaseConnector):
         base_query = {
             "access_token": self.cfg.access_token,
             "geometries": "polyline6",
-            "overview": "full",
-            "steps": "true",
-            "annotations": "duration,distance",
+            "overview": _mapbox_overview(opts),
             "roundtrip": "true" if opts.is_round_trip else "false",
         }
         if opts.is_round_trip:
@@ -146,7 +160,7 @@ class MapboxRoutingConnector(BaseConnector):
         if opts.departure_time:
             base_query["depart_at"] = iso_string(opts.departure_time)
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
-        return self.send_get(url, m_headers, m_query)
+        return self.send_get(url, m_headers, m_query), _mapbox_effective_geometries(m_query)
 
 
 class MapboxMatrixConnector(BaseConnector):
@@ -222,11 +236,30 @@ class MapboxGeocodingConnector(BaseConnector):
         base_query = {"q": opts.input, "access_token": self.cfg.access_token, "session_token": str(uuid.uuid4())}
         if opts.language:
             base_query["language"] = opts.language
+        # `country_filter` (ISO 3166-1 alpha-2) → Searchbox `country=` (lowercase,
+        # comma-separated), same translation as forward geocode.
+        if opts.country_filter:
+            base_query["country"] = ",".join(c.lower() for c in opts.country_filter)
         raw = self._get(_SEARCHBOX_URL, base_query, opts.passthrough)
         preds: List[AutocompletePrediction] = []
         for s in jlist(jget(raw, "suggestions")) or []:
             desc = jstr(jget(s, "full_address")) or jstr(jget(s, "name"))
-            preds.append(AutocompletePrediction(description=desc, place_id=jstr(jget(s, "mapbox_id")) or None))
+            # Search Box returns `name` (the POI/street) and `place_formatted` (the
+            # rest of the address) as separate fields.
+            name = jstr(jget(s, "name"))
+            structured = None
+            if name:
+                structured = AutocompleteStructuredFormat(
+                    main_text=name,
+                    secondary_text=jstr(jget(s, "place_formatted")) or None,
+                )
+            preds.append(
+                AutocompletePrediction(
+                    description=desc,
+                    place_id=jstr(jget(s, "mapbox_id")) or None,
+                    structured_format=structured,
+                )
+            )
         return AutocompleteResult(predictions=preds, raw=raw)
 
     def _get(self, url, base_query, pt):
@@ -236,6 +269,41 @@ class MapboxGeocodingConnector(BaseConnector):
             raw = decode_json(resp.body)
             raise provider_error(resp.status, resp.headers, raw, _mapbox_status_code(resp.status), _mapbox_message(raw))
         return decode_json(resp.body)
+
+    def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
+        """Resolve a Mapbox ``mapbox_id`` to a full candidate.
+
+        ``GET https://api.mapbox.com/search/searchbox/v1/retrieve/{mapbox_id}``
+
+        Pass the SAME ``session_token`` used for the preceding ``autocomplete()``
+        call: Search Box bills per *session*, so a matching token makes
+        suggest+retrieve one billable session while a missing or fresh one makes it
+        two.
+        """
+        base_query = {"access_token": self.cfg.access_token}
+        if opts.session_token:
+            base_query["session_token"] = opts.session_token
+        if opts.language:
+            base_query["language"] = opts.language
+
+        url = f"{_RETRIEVE_URL}/{quote(opts.place_id, safe='')}"
+        raw = self._get(url, base_query, opts.passthrough)
+
+        # Retrieve returns a GeoJSON FeatureCollection — the same shape as v6
+        # geocode, so the geocode normalizer applies unchanged.
+        candidates = _normalize_mapbox_features(raw)
+        if not candidates:
+            raise classified_error(
+                ProviderCode.NO_ROUTE, None, raw, "Mapbox Place Details returned no feature"
+            )
+
+        name = None
+        if opts.includes(PlaceDetailsInclude.NAME):
+            features = jlist(jget(raw, "features")) or []
+            if features:
+                name = jstr(jget(jget(features[0], "properties"), "name")) or None
+
+        return PlaceDetailsResult(candidate=candidates[0], name=name, raw=raw)
 
 
 class MapboxIsochroneConnector(BaseConnector):
@@ -318,8 +386,30 @@ def _mapbox_status_code(status: int) -> ProviderCode:
     return ProviderCode.UNKNOWN
 
 
+def _mapbox_overview(opts: RoutingOptions) -> str:
+    """Map the normalized ``polyline_quality`` onto Mapbox's ``overview``.
+
+    ``simplified`` is the default and the reason is measured, not aesthetic: on one
+    ~140km route the simplified geometry was 203 characters against 6146 for
+    ``full`` — a 30x payload for vertices most callers never look at, with
+    identical distances and durations.
+
+    ``steps`` and ``annotations`` are deliberately NOT sent. Nothing in
+    ``RoutingResult`` reads turn-by-turn steps or per-segment annotations, and
+    steps are the single largest part of a Mapbox routing response — so requesting
+    them inflated every response for data the wrapper then discarded. A consumer
+    who wants them adds ``passthrough.query``.
+    """
+    return "full" if opts.polyline_quality == PolylineQuality.DETAILED else "simplified"
+
+
 def _mapbox_body_code(code: str) -> ProviderCode:
-    if code in ("NoRoute", "NoTrips", "NoSegment", "InvalidInput", "ProfileNotFound"):
+    # The request was well-formed and Mapbox answered — there is simply no
+    # connecting route (or no road near a coordinate to snap to). Live-verified:
+    # Mapbox serves this on HTTP 200 as well as 422.
+    if code in ("NoRoute", "NoTrips", "NoSegment"):
+        return ProviderCode.NO_ROUTE
+    if code in ("InvalidInput", "ProfileNotFound"):
         return ProviderCode.INVALID_REQUEST
     return ProviderCode.UNKNOWN
 
@@ -332,7 +422,13 @@ def _mapbox_routing_vendor_error(status: int, headers, body: Any) -> ConnectorEr
     elif status == 429:
         pc = ProviderCode.RATE_LIMITED
     elif status == 422:
-        pc = ProviderCode.INVALID_REQUEST if code in ("NoRoute", "NoTrips") else ProviderCode.UNKNOWN
+        # Live-verified: Mapbox serves its no-route envelope with HTTP 422 as well
+        # as 200, so the envelope code — not the status — decides.
+        pc = (
+            ProviderCode.NO_ROUTE
+            if code in ("NoRoute", "NoTrips", "NoSegment")
+            else ProviderCode.UNKNOWN
+        )
     elif 500 <= status < 600:
         pc = ProviderCode.PROVIDER_UNAVAILABLE
     elif status == 400:
@@ -369,6 +465,56 @@ def _normalize_mapbox_features(raw: Any) -> List[GeocodeCandidate]:
             viewport = Viewport(LatLng(bbox[1], bbox[0]), LatLng(bbox[3], bbox[2]))
         out.append(GeocodeCandidate(formatted_address=addr, location=LatLng(lat, lng), place_id=jstr(jget(props, "mapbox_id")) or None, viewport=viewport))
     return out
+
+
+def _mapbox_effective_geometries(query: Any) -> str:
+    """The `geometries` value actually sent, after `_passthrough.query` merged
+    over the connector's own ``polyline6``.
+
+    The geometry decoder MUST match what was requested. Decoding a precision-5
+    ``polyline`` with the precision-6 decoder divides every coordinate by 10 — a
+    silent 10x position shift, not an error — so the connector reads back its own
+    effective query rather than assuming its default survived the override.
+    """
+    if isinstance(query, dict):
+        value = query.get("geometries")
+        if isinstance(value, str) and value:
+            return value
+    return "polyline6"
+
+
+def _normalize_mapbox_geometry(geometry: Any, geometries: str) -> str:
+    """Normalize a Mapbox route geometry to the canonical precision-5 polyline,
+    honoring the effective ``geometries`` parameter:
+
+    * ``polyline6`` (connector default) — decode at precision 6, re-encode at 5.
+    * ``polyline`` — already precision-5; emit verbatim (as OSRM does).
+    * ``geojson`` — encode the ``[lng, lat]`` coordinate pairs at precision 5.
+
+    Returns ``""`` for an absent, empty, or unparseable geometry rather than
+    raising — the leg distance/duration fields are still meaningful.
+    """
+    if geometries == "geojson":
+        coordinates = jget(geometry, "coordinates")
+        if not isinstance(coordinates, list):
+            return ""
+        points: List[LatLng] = []
+        for pair in coordinates:
+            if not isinstance(pair, list) or len(pair) < 2:
+                return ""
+            lng, lat = jnum_opt(pair[0]), jnum_opt(pair[1])
+            if lat is None or lng is None:
+                return ""
+            # GeoJSON is [lng, lat] order.
+            points.append(LatLng(lat, lng))
+        return encode_polyline(points)
+
+    encoded = jstr(geometry)
+    if not encoded:
+        return ""
+    if geometries == "polyline":
+        return encoded
+    return encode_polyline(_decode_mapbox_p6(encoded))
 
 
 def _decode_mapbox_p6(encoded: str) -> List[LatLng]:

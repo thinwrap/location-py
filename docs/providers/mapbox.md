@@ -48,6 +48,22 @@ Create a token at https://account.mapbox.com/access-tokens/. Sent as `access_tok
 
 Standard `RoutingOptions`. Travel mode is encoded into the URL path. Polyline returned in standard Google precision-5 format.
 
+### Overriding `geometries` via passthrough
+
+The connector requests `geometries=polyline6` and re-encodes to precision-5. If you override
+`geometries` through `passthrough.query`, the decoder **follows your value**:
+
+| `geometries` | Handling |
+|---|---|
+| `polyline6` (default) | decoded at precision 6, re-encoded at precision 5 |
+| `polyline` | already precision-5 — emitted verbatim |
+| `geojson` | `[lng, lat]` pairs encoded at precision 5 |
+
+This matters because the two encodings are indistinguishable as strings: decoding a
+precision-5 polyline with a precision-6 decoder divides every coordinate by 10, which lands
+your route in the wrong hemisphere with no error raised. An unparseable geometry yields an
+empty polyline rather than raising — the leg distances and durations are still valid.
+
 ### Error mapping
 
 | Vendor HTTP | Vendor signal | `ProviderCode` |
@@ -73,6 +89,30 @@ res = routing.route(RoutingOptions(
 ))
 ```
 
+### Turn-by-turn instructions
+
+Off by default and **not normalized** — `RoutingResult` has no `steps` attribute. Ask for `steps`
+and read them from `res.raw`:
+
+```python
+res = routing.route(RoutingOptions(
+    waypoints=[origin, destination],
+    passthrough=Passthrough(query={"steps": "true"}),
+))
+```
+
+Instruction text is at `routes[].legs[].steps[].maneuver.instruction`, alongside `type`,
+`modifier`, `bearing_before` / `bearing_after` and `location`. With `optimize=True` the connector
+calls `/optimized-trips/v1`, which returns the same objects under **`trips[]`** rather than
+`routes[]`.
+
+`steps` is its own parameter, so this merges additively — nothing the connector sends is
+displaced. `banner_instructions` and `voice_instructions` (SSML) are separate opt-ins, and both
+require `steps=true`.
+
+Steps are the single largest part of a Mapbox routing response, which is why the connector does
+not request them by default.
+
 ---
 
 ## Matrix
@@ -97,7 +137,25 @@ Same as routing. Retry-After surfacing identical.
 
 ### Input
 
-`country_filter` (ISO 3166-1 alpha-2) is translated to lowercased CSV `country=us,ca`. Other Geocoding/Searchbox-specific fields go via `passthrough.query`.
+Standard `GeocodeOptions` / `ReverseGeocodeOptions` / `AutocompleteOptions`. Other
+Geocoding/Searchbox-specific fields go via `passthrough.query`.
+
+### Country filter
+
+`country_filter` (ISO 3166-1 alpha-2) is translated to lowercased CSV `country=us,ca` on
+**forward geocode and autocomplete alike**.
+
+```python
+res = geo.autocomplete(AutocompleteOptions(input="coffee", country_filter=["IL", "PS"]))
+# → ...&country=il,ps
+```
+
+### No match-highlighting offsets
+
+Search Box `/suggest` returns no match offsets — no `matches`, `highlights` or equivalent.
+Of the five geocoders only Google and HERE return them, so a UI that bolds the matched
+substring cannot get those offsets from Mapbox; it has to match client-side against
+`description` / `structured_format`.
 
 ---
 

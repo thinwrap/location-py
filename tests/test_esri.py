@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 from helpers import FakeTransport, body_form, qget, resp
@@ -29,13 +30,24 @@ TWO = [LatLng(1, 1), LatLng(2, 2)]
 
 def test_routing():
     # `stops` FeatureSet in INPUT order; Sequence is the 1-based visiting position.
-    body = '{"routes":{"features":[{"attributes":{"Total_Length":1000,"Total_Time":10},"geometry":{"paths":[[[-74,40],[-73,41]]]}}]},"stops":{"features":[{"attributes":{"Sequence":1}},{"attributes":{"Sequence":2}}]},"directions":[{"features":[{"attributes":{"maneuverType":"esriDMTStop","length":0,"time":0}},{"attributes":{"length":1000,"time":10}},{"attributes":{"maneuverType":"esriDMTStop","length":0,"time":0}}]}]}'
+    # Legs come from the stops FeatureSet's cumulative costs; no directions output.
+    body = json.dumps(
+        {
+            "routes": {"features": [{"attributes": {"Total_TravelTime": 10, "Total_Kilometers": 1}, "geometry": {"paths": [[[-74, 40], [-73, 41]]]}}]},
+            "stops": {"features": [
+                {"attributes": {"Sequence": 1, "Status": 0, "Cumul_TravelTime": 0, "Cumul_Kilometers": 0}},
+                {"attributes": {"Sequence": 2, "Status": 0, "Cumul_TravelTime": 10, "Cumul_Kilometers": 1}},
+            ]},
+        }
+    )
     fake = FakeTransport(resp(200, body))
     r = Routing(EsriConfig(api_key="apikey"), transport=fake)
     res = r.route(RoutingOptions(waypoints=[LatLng(40, -74), LatLng(41, -73)]))
     assert res.total_distance_meters == 1000 and res.total_duration_seconds == 600
     assert len(res.legs) == 1 and res.legs[0].distance_meters == 1000 and res.legs[0].duration_seconds == 600
-    assert res.polyline != "" and res.waypoint_order == [0, 1]
+    # waypoint_order is surfaced for OPTIMIZED routes only: stops are always requested,
+    # so an unoptimized route must report no ordering, not an identity permutation.
+    assert res.polyline != "" and res.waypoint_order is None
     assert body_form(fake.last)["token"] == "apikey"
 
 
@@ -83,11 +95,9 @@ def test_routing_walking_totals_from_directions_summary():
         '{"routes":{"features":[{"attributes":{"Total_WalkTime":13.094903051108146,'
         '"Total_Kilometers":1.091226960340165,"Total_Miles":0.678},'
         '"geometry":{"paths":[[[-74,40],[-73,41]]]}}]},'
-        '"directions":[{"summary":{"totalLength":1091.226960340165,"totalTime":13.094903051108146,'
-        '"totalDriveTime":13.094903051108146},'
-        '"features":[{"attributes":{"maneuverType":"esriDMTStop","length":0,"time":0}},'
-        '{"attributes":{"length":1091.226960340165,"time":13.094903051108146}},'
-        '{"attributes":{"maneuverType":"esriDMTStop","length":0,"time":0}}]}]}'
+        '"stops":{"features":['
+        '{"attributes":{"Sequence":1,"Status":0,"Cumul_WalkTime":0,"Cumul_Kilometers":0}},'
+        '{"attributes":{"Sequence":2,"Status":0,"Cumul_WalkTime":13.094903051108146,"Cumul_Kilometers":1.091226960340165}}]}}'
     )
     fake = FakeTransport(resp(200, body))
     res = Routing(EsriConfig(api_key="k"), transport=fake).route(
@@ -230,3 +240,77 @@ def test_isochrone_walking_sends_full_travel_mode_object():
     assert travel_mode["type"] == "WALK"
     assert travel_mode["impedanceAttributeName"] == "WalkTime"
     assert travel_mode["name"] == "Walking Time"
+
+
+
+
+def test_routing_derives_legs_and_totals_from_cumulative_stop_costs():
+    """Legs AND totals from one source, so they cannot disagree — replaces parsing the
+    legacy (superseded) directions output."""
+    body = json.dumps(
+        {
+            "routes": {"features": [{"attributes": {"Total_TravelTime": 30, "Total_Kilometers": 12}, "geometry": {"paths": [[[0, 0], [1, 1]]]}}]},
+            "stops": {"features": [
+                {"attributes": {"Sequence": 1, "Status": 0, "Cumul_TravelTime": 0, "Cumul_Kilometers": 0}},
+                {"attributes": {"Sequence": 2, "Status": 0, "Cumul_TravelTime": 10, "Cumul_Kilometers": 4}},
+                {"attributes": {"Sequence": 3, "Status": 0, "Cumul_TravelTime": 30, "Cumul_Kilometers": 12}},
+            ]},
+        }
+    )
+    fake = FakeTransport(resp(200, body))
+    res = Routing(EsriConfig(api_key="k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(0, 0), LatLng(1, 1), LatLng(2, 2)])
+    )
+    assert [(l.distance_meters, l.duration_seconds) for l in res.legs] == [(4000, 600), (8000, 1200)]
+    assert res.total_distance_meters == 12000 and res.total_duration_seconds == 1800
+    # The invariant that is now structural rather than coincidental.
+    assert sum(l.distance_meters for l in res.legs) == res.total_distance_meters
+    assert sum(l.duration_seconds for l in res.legs) == res.total_duration_seconds
+
+    form = body_form(fake.last)
+    assert form["returnStops"] == "true"
+    # Explicit false is load-bearing: the SERVICE DEFAULT is true.
+    assert form["returnDirections"] == "false"
+    assert form["accumulateAttributeNames"] == "TravelTime,Kilometers"
+    assert form["outputLines"] == "esriNAOutputLineTrueShape"
+    assert "directionsOutputType" not in form
+
+
+def test_routing_differences_stops_in_visit_order():
+    """Stops come back in INPUT order while cumulative costs run along the route; with
+    findBestSequence those differ, and skipping the sort yields negative legs."""
+    body = json.dumps(
+        {
+            "routes": {"features": [{"attributes": {"Total_TravelTime": 30, "Total_Kilometers": 12}, "geometry": {"paths": [[[0, 0], [1, 1]]]}}]},
+            "stops": {"features": [
+                {"attributes": {"Sequence": 1, "Status": 0, "Cumul_TravelTime": 0, "Cumul_Kilometers": 0}},
+                {"attributes": {"Sequence": 3, "Status": 0, "Cumul_TravelTime": 30, "Cumul_Kilometers": 12}},
+                {"attributes": {"Sequence": 2, "Status": 0, "Cumul_TravelTime": 10, "Cumul_Kilometers": 4}},
+            ]},
+        }
+    )
+    fake = FakeTransport(resp(200, body))
+    res = Routing(EsriConfig(api_key="k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(0, 0), LatLng(1, 1), LatLng(2, 2)], optimize=True)
+    )
+    assert [l.distance_meters for l in res.legs] == [4000, 8000]
+
+
+def test_routing_falls_back_when_a_stop_failed_to_locate():
+    """A non-zero Status carries no usable cumulative cost, so every later difference
+    would be wrong; prefer the route's own totals plus an even split."""
+    body = json.dumps(
+        {
+            "routes": {"features": [{"attributes": {"Total_TravelTime": 20, "Total_Kilometers": 1}, "geometry": {"paths": [[[0, 0], [1, 1]]]}}]},
+            "stops": {"features": [
+                {"attributes": {"Sequence": 1, "Status": 0, "Cumul_TravelTime": 0, "Cumul_Kilometers": 0}},
+                {"attributes": {"Sequence": 2, "Status": 7, "Cumul_TravelTime": 20, "Cumul_Kilometers": 1}},
+            ]},
+        }
+    )
+    fake = FakeTransport(resp(200, body))
+    res = Routing(EsriConfig(api_key="k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(0, 0), LatLng(1, 1)])
+    )
+    assert res.total_distance_meters == 1000 and res.total_duration_seconds == 1200
+    assert len(res.legs) == 1 and res.legs[0].distance_meters == 1000

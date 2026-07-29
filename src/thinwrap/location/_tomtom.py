@@ -7,20 +7,31 @@ import time
 from typing import Any, Callable, List, Optional
 from urllib.parse import quote
 
-from ._jsonpath import jget, jlist, jnum, jstr
+from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
 from ._util import decode_json, iso_string, ok_status
+from ._waypoint_order import is_complete_waypoint_order
 from .base import BaseConnector
 from .config import TomTomConfig
 from .coordinate import assert_finite, fmt_coord, to_lat_lng_string
-from .enums import IsochroneType, TravelMode
-from .errors import ConnectorError, ProviderCode, invalid_request, provider_error, unknown_error
+from .enums import IsochroneType, PlaceDetailsInclude, RoutingInclude, TrafficMode, TravelMode
+from .errors import (
+    ConnectorError,
+    ProviderCode,
+    classified_error,
+    invalid_request,
+    provider_error,
+    unknown_error,
+)
 from .geocoding import (
     AutocompleteOptions,
     AutocompletePrediction,
     AutocompleteResult,
+    AutocompleteStructuredFormat,
     GeocodeCandidate,
     GeocodeOptions,
     GeocodeResult,
+    PlaceDetailsOptions,
+    PlaceDetailsResult,
     ReverseGeocodeOptions,
     ReverseGeocodeResult,
     Viewport,
@@ -39,6 +50,7 @@ _ASYNC_MATRIX_URL = "https://api.tomtom.com/routing/matrix/2/async"
 _GEOCODE_URL = "https://api.tomtom.com/search/2/geocode"
 _REVERSE_URL = "https://api.tomtom.com/search/2/reverseGeocode"
 _SEARCH_URL = "https://api.tomtom.com/search/2/search"
+_PLACE_BY_ID_URL = "https://api.tomtom.com/search/2/place.json"
 _REACHABLE_RANGE_URL = "https://api.tomtom.com/routing/1/calculateReachableRange"
 _SYNC_CELL_THRESHOLD = 2500
 
@@ -67,6 +79,18 @@ class TomTomRoutingConnector(BaseConnector):
         base_query = {"key": self.cfg.api_key, "travelMode": _tomtom_travel_mode(opts.travel_mode), "routeType": "fastest", "routeRepresentation": "polyline"}
         if opts.optimize and len(wps) > 2:
             base_query["computeBestOrder"] = "true"
+        # TomTom's `traffic` parameter defaults to ON at the vendor, so leaving it
+        # unset would contradict the normalized default of TrafficMode.NONE. Send it
+        # explicitly in both directions.
+        base_query["traffic"] = "true" if opts.traffic_mode == TrafficMode.LIVE else "false"
+
+        # noTrafficTravelTimeInSeconds only appears when computeTravelTimeFor=all is
+        # requested, and that asks TomTom for extra computed values — so unlike
+        # Google/HERE it is a real request change and stays strictly opt-in.
+        wants_no_traffic = opts.includes(RoutingInclude.DURATION_WITHOUT_TRAFFIC)
+        if wants_no_traffic:
+            base_query["computeTravelTimeFor"] = "all"
+
         if opts.departure_time:
             base_query["departAt"] = iso_string(opts.departure_time)
         av = _tomtom_avoids(opts)
@@ -79,14 +103,29 @@ class TomTomRoutingConnector(BaseConnector):
         raw = decode_json(resp.body)
         routes = raw.get("routes") if isinstance(raw, dict) else None
         if not routes:
-            raise unknown_error(resp.status, raw, "TomTom Routing returned no routes")
+            raise classified_error(
+                ProviderCode.NO_ROUTE, resp.status, raw, "TomTom Routing returned no routes"
+            )
         route = routes[0]
 
         legs: List[RoutingLeg] = []
         pts: List[LatLng] = []
         for leg in route.get("legs") or []:
             summ = leg.get("summary") or {}
-            legs.append(RoutingLeg(jnum(summ.get("lengthInMeters")), jnum(summ.get("travelTimeInSeconds"))))
+            no_traffic = summ.get("noTrafficTravelTimeInSeconds")
+            legs.append(
+                RoutingLeg(
+                    jnum(summ.get("lengthInMeters")),
+                    jnum(summ.get("travelTimeInSeconds")),
+                    duration_without_traffic_seconds=(
+                        float(no_traffic)
+                        if wants_no_traffic
+                        and isinstance(no_traffic, (int, float))
+                        and not isinstance(no_traffic, bool)
+                        else None
+                    ),
+                )
+            )
             for p in leg.get("points") or []:
                 pts.append(LatLng(jnum(p.get("latitude")), jnum(p.get("longitude"))))
 
@@ -98,10 +137,18 @@ class TomTomRoutingConnector(BaseConnector):
             # (providedIndex 0-based over intermediates, origin/destination
             # excluded). Project to full input indices and bracket with the
             # fixed origin (0) and destination (N-1) for the canonical order.
+            #
+            # The projection is only meaningful if it yields a complete
+            # permutation: a short, duplicated, or sentinel providedIndex list
+            # would otherwise produce an ordering that silently drops or repeats
+            # a waypoint.
             intermediates = [int(jnum(w.get("providedIndex"))) + 1 for w in ordered]
-            waypoint_order = [0, *intermediates, len(opts.waypoints) - 1]
+            candidate = [0, *intermediates, len(opts.waypoints) - 1]
+            if is_complete_waypoint_order(candidate, len(opts.waypoints)):
+                waypoint_order = candidate
 
         summary = route.get("summary") or {}
+        total_no_traffic = summary.get("noTrafficTravelTimeInSeconds")
         return RoutingResult(
             legs=legs,
             total_distance_meters=jnum(summary.get("lengthInMeters")),
@@ -109,6 +156,13 @@ class TomTomRoutingConnector(BaseConnector):
             polyline=encode_polyline(pts),
             waypoint_order=waypoint_order,
             raw=raw,
+            total_duration_without_traffic_seconds=(
+                float(total_no_traffic)
+                if wants_no_traffic
+                and isinstance(total_no_traffic, (int, float))
+                and not isinstance(total_no_traffic, bool)
+                else None
+            ),
         )
 
 
@@ -208,7 +262,11 @@ class TomTomGeocodingConnector(BaseConnector):
         if opts.country_filter:
             base_query["countrySet"] = ",".join(opts.country_filter)
         raw = self._get(url, base_query, opts.passthrough)
-        cands = [_normalize_tomtom_candidate(r) for r in (jlist(jget(raw, "results")) or [])]
+        cands = [
+            c
+            for c in (_normalize_tomtom_candidate(r) for r in (jlist(jget(raw, "results")) or []))
+            if c is not None
+        ]
         return GeocodeResult(candidates=cands, raw=raw)
 
     def reverse_geocode(self, opts: ReverseGeocodeOptions) -> ReverseGeocodeResult:
@@ -244,13 +302,33 @@ class TomTomGeocodingConnector(BaseConnector):
             base_query["lon"] = fmt_coord(opts.location.lng)
         if opts.radius is not None:
             base_query["radius"] = fmt_coord(opts.radius)
+        # `country_filter` (ISO 3166-1 alpha-2) → TomTom `countrySet=<comma-csv>`,
+        # same translation as forward geocode.
+        if opts.country_filter:
+            base_query["countrySet"] = ",".join(opts.country_filter)
         raw = self._get(url, base_query, opts.passthrough)
         preds: List[AutocompletePrediction] = []
         for r in jlist(jget(raw, "results")) or []:
             free = jstr(jget(jget(r, "address"), "freeformAddress"))
             poi_name = jstr(jget(jget(r, "poi"), "name"))
             desc = f"{poi_name}, {free}" if poi_name else free
-            preds.append(AutocompletePrediction(description=desc, place_id=jstr(jget(r, "id")) or None))
+            # Live-verified: `poi.name` is undefined for street/address results, which
+            # have no distinct main part. Leave the whole object None there rather than
+            # splitting `freeformAddress` on a comma, which would be a guess.
+            poi_name = jstr(jget(jget(r, "poi"), "name"))
+            structured = None
+            if poi_name:
+                structured = AutocompleteStructuredFormat(
+                    main_text=poi_name,
+                    secondary_text=jstr(jget(jget(r, "address"), "freeformAddress")) or None,
+                )
+            preds.append(
+                AutocompletePrediction(
+                    description=desc,
+                    place_id=jstr(jget(r, "id")) or None,
+                    structured_format=structured,
+                )
+            )
         return AutocompleteResult(predictions=preds, raw=raw)
 
     def _get(self, url, base_query, pt):
@@ -262,6 +340,36 @@ class TomTomGeocodingConnector(BaseConnector):
         if raw is None:
             raise unknown_error(resp.status, None, "TomTom returned a non-JSON/unparseable body")
         return raw
+
+    def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
+        """Resolve a TomTom result id to a full candidate.
+
+        ``GET https://api.tomtom.com/search/2/place.json?entityId=`` — a plain lookup,
+        no per-session billing concept.
+        """
+        base_query = {"key": self.cfg.api_key, "entityId": opts.place_id}
+        if opts.language:
+            base_query["language"] = opts.language
+
+        _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
+        resp = self.send_get(_PLACE_BY_ID_URL, m_headers, m_query)
+        raw = decode_json(resp.body)
+        if not ok_status(resp.status):
+            raise _tomtom_http_error(resp.status, resp.headers, resp.body, True)
+
+        results = jlist(jget(raw, "results")) or []
+        first = results[0] if results else None
+        candidate = _normalize_tomtom_candidate(first) if first is not None else None
+        if candidate is None:
+            raise classified_error(
+                ProviderCode.NO_ROUTE, resp.status, raw, "TomTom Place Details returned no result"
+            )
+
+        name = None
+        if opts.includes(PlaceDetailsInclude.NAME):
+            name = jstr(jget(jget(first, "poi"), "name")) or None
+
+        return PlaceDetailsResult(candidate=candidate, name=name, raw=raw)
 
 
 class TomTomIsochroneConnector(BaseConnector):
@@ -364,6 +472,25 @@ def _tomtom_map_vendor_error(status: int, with_404: bool) -> ProviderCode:
     return ProviderCode.UNKNOWN
 
 
+def _tomtom_classify_error(status: int, raw: Any, with_404: bool) -> ProviderCode:
+    """Extend the status mapping with TomTom's machine-readable
+    ``detailedError.code``, which is the only way to tell "no route" from
+    "malformed request" — both arrive as HTTP 400.
+
+    Live-verified: ``MAP_MATCHING_FAILURE`` on a 400. ``NO_ROUTE_FOUND`` is
+    TomTom's documented sibling code for the same outcome; it is mapped too, but
+    note it is doc-sourced rather than reproduced live — every live attempt at a
+    truly unreachable pair returned a route, because TomTom (like every other
+    provider tested) routes via ferries.
+    """
+    # Proxy/auth statuses win: they carry no routing envelope.
+    if status in (401, 403, 429) or 500 <= status < 600:
+        return _tomtom_map_vendor_error(status, with_404)
+    if jstr(jget(jget(raw, "detailedError"), "code")) in ("MAP_MATCHING_FAILURE", "NO_ROUTE_FOUND"):
+        return ProviderCode.NO_ROUTE
+    return _tomtom_map_vendor_error(status, with_404)
+
+
 def _tomtom_error_message(body: Any) -> str:
     m = jstr(jget(jget(body, "detailedError"), "message"))
     if m:
@@ -386,15 +513,23 @@ def _tomtom_error_message(body: Any) -> str:
 
 def _tomtom_http_error(status: int, headers, data: bytes, with_404: bool) -> ConnectorError:
     raw = decode_json(data)
-    return provider_error(status, headers, raw, _tomtom_map_vendor_error(status, with_404), _tomtom_error_message(raw))
+    return provider_error(status, headers, raw, _tomtom_classify_error(status, raw, with_404), _tomtom_error_message(raw))
 
 
-def _normalize_tomtom_candidate(r: Any) -> GeocodeCandidate:
+def _normalize_tomtom_candidate(r: Any) -> Optional[GeocodeCandidate]:
+    """Map a TomTom search result onto a GeocodeCandidate.
+
+    Returns ``None`` when the result has no real position — the caller skips it
+    rather than emitting a fabricated (0,0) "Null Island" candidate.
+    """
     pos = jget(r, "position") or {}
+    lat, lon = jnum_opt(pos.get("lat")), jnum_opt(pos.get("lon"))
+    if lat is None or lon is None:
+        return None
     viewport = None
     vp = jget(r, "viewport")
     if isinstance(vp, dict):
         tl, br = jget(vp, "topLeftPoint"), jget(vp, "btmRightPoint")
         if isinstance(tl, dict) and isinstance(br, dict):
             viewport = Viewport(LatLng(jnum(br.get("lat")), jnum(tl.get("lon"))), LatLng(jnum(tl.get("lat")), jnum(br.get("lon"))))
-    return GeocodeCandidate(formatted_address=jstr(jget(jget(r, "address"), "freeformAddress")), location=LatLng(jnum(pos.get("lat")), jnum(pos.get("lon"))), place_id=jstr(jget(r, "id")) or None, viewport=viewport)
+    return GeocodeCandidate(formatted_address=jstr(jget(jget(r, "address"), "freeformAddress")), location=LatLng(lat, lon), place_id=jstr(jget(r, "id")) or None, viewport=viewport)

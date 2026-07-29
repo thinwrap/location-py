@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 from .enums import ProviderID
 
@@ -58,6 +59,27 @@ class OsrmConfig:
     """Self-hosted OSRM (routing, matrix only). base_url is required."""
 
     base_url: str
+
+    #: Exclude classes THIS OSRM build accepts — ``"toll"``, ``"ferry"``,
+    #: ``"motorway"``.
+    #:
+    #: Whether a class is accepted is a property of the OPERATOR'S SERVER, not of
+    #: OSRM, which is why it has to be declared rather than assumed. Verified live
+    #: on two builds that answer the same request differently: ``exclude=toll`` is
+    #: rejected with ``InvalidValue`` by the public demo build, and honoured by a
+    #: self-hosted instance where it genuinely changed the route (138075 m / 5890 s
+    #: via the toll road -> 130421 m / 6513 s without it).
+    #:
+    #: Stock OSRM compiles no exclude classes, so by default the connector rejects
+    #: ``avoid_tolls`` / ``avoid_ferries`` / ``avoid_highways`` up front with
+    #: ``unsupported_option`` — better than sending a request the server will bounce
+    #: with an opaque ``InvalidValue``. List the classes your profile was built with
+    #: and the matching avoid-flags start working.
+    #:
+    #: Declared rather than probed because there is no way to ask an OSRM server
+    #: what it supports without issuing a request that fails, and the wrapper holds
+    #: no state to cache such a probe in.
+    supported_exclude_classes: Sequence[str] = ()
 
     @property
     def provider_id(self) -> ProviderID:
