@@ -10,7 +10,7 @@ from typing import Any, List, Optional
 
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
 from ._route_completeness import assert_route_has_legs
-from ._util import decode_json, iso_string, ok_status
+from ._util import decode_json, iso_seconds_string, ok_status
 from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import MapboxConfig
@@ -123,7 +123,9 @@ class MapboxRoutingConnector(BaseConnector):
         if ex:
             base_query["exclude"] = ex
         if opts.departure_time:
-            base_query["depart_at"] = iso_string(opts.departure_time)
+            # Mapbox documents `depart_at` as one of exactly three ISO 8601
+            # forms, none carrying milliseconds — so seconds precision.
+            base_query["depart_at"] = iso_seconds_string(opts.departure_time)
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         return self.send_get(url, m_headers, m_query), _mapbox_effective_geometries(m_query)
 
@@ -158,7 +160,9 @@ class MapboxRoutingConnector(BaseConnector):
         if ex:
             base_query["exclude"] = ex
         if opts.departure_time:
-            base_query["depart_at"] = iso_string(opts.departure_time)
+            # Mapbox documents `depart_at` as one of exactly three ISO 8601
+            # forms, none carrying milliseconds — so seconds precision.
+            base_query["depart_at"] = iso_seconds_string(opts.departure_time)
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         return self.send_get(url, m_headers, m_query), _mapbox_effective_geometries(m_query)
 

@@ -48,6 +48,48 @@ Provision a project at https://platform.here.com/ and create a REST API key. Sen
 
 `optimize=True` triggers the two-step `findsequence2` → `routes` flow. Travel mode maps to HERE `transportMode`. Intermediate waypoints are added as `via=lat,lng` query parameters.
 
+`transport_mode` (a `HereTransportMode`) overrides the base `travel_mode` mapping with HERE's own
+vehicle classes:
+
+| Value | `/v8/routes` | `findsequence2` (`optimize=True`) |
+|---|---|---|
+| `CAR`, `TRUCK`, `PEDESTRIAN`, `BICYCLE`, `SCOOTER`, `TAXI` | yes | yes |
+| `BUS` | yes | yes |
+| `PRIVATE_BUS` | yes | **no — HTTP 400** |
+
+`BUS` and `PRIVATE_BUS` are **not synonyms**. `BUS` may drive through bus-restricted and
+bus-exclusive streets; `PRIVATE_BUS` uses those streets only where a waypoint sits on one, which
+is the private pick-up / drop-off case. HERE lists `BICYCLE`, `BUS` and `PRIVATE_BUS` as Beta.
+
+Because optimization runs through the legacy `findsequence2` endpoint, whose `mode` grammar
+accepts only `car`, `truck`, `pedestrian`, `bus`, `bicycle`, `scooter` and `taxi`, combining
+`PRIVATE_BUS` with `optimize=True` fails with `invalid_request` and the provider message
+`Unknown transport mode 'privateBus'`. The connector forwards the value verbatim rather than
+substituting `BUS` for you — pick `BUS` yourself when you need optimization.
+
+HERE's routing enum has one further value, `networkRestrictedTruck`, deliberately omitted here:
+`findsequence2` and Matrix v8 both reject it, and `/v8/routes` returns 400
+`Missing 'networkRestrictedTruck[permittedNetworks]' parameter` unless that companion parameter
+is supplied, which the connector does not model. Reach it through `passthrough.query` together
+with `networkRestrictedTruck[permittedNetworks]` if you need it.
+
+Taxi-specific tuning is likewise `passthrough.query`; HERE's bracketed keys pass through
+verbatim:
+
+```python
+routing.route(RoutingOptions(
+    waypoints=[origin, destination],
+    transport_mode=HereTransportMode.TAXI,
+    # Default is true. When true, HERE also ignores traffic on roads with taxi
+    # lanes, on the assumption a taxi can bypass the congestion.
+    passthrough=Passthrough(query={"taxi[allowDriveThroughTaxiRoads]": "false"}),
+))
+```
+
+> `passthrough.query` is merged into **both** legs of the optimized flow. `findsequence2`
+> ignores query parameters it does not recognize (verified live), so a `/v8/routes`-only key
+> such as `taxi[...]` rides along harmlessly rather than failing the sequence call.
+
 ### Error mapping
 
 | Vendor HTTP | Vendor signal | `ProviderCode` |
@@ -94,7 +136,10 @@ same `return` list.
 
 ### Input
 
-`transport_mode` (a `HereTransportMode`: `CAR` | `TRUCK` | `PEDESTRIAN` | `BICYCLE` | `SCOOTER`) overrides the base `travel_mode` mapping. Polling parameters surfaced via `passthrough.body["timeoutMs"]`.
+`transport_mode` (a `HereTransportMode`) overrides the base `travel_mode` mapping. Matrix v8
+publishes the same eight values as Routing v8 — `CAR`, `TRUCK`, `PEDESTRIAN`, `BICYCLE`,
+`SCOOTER`, `TAXI`, `BUS`, `PRIVATE_BUS` — with no `findsequence2` caveat, since matrix is a
+single call. Polling parameters surfaced via `passthrough.body["timeoutMs"]`.
 
 ---
 

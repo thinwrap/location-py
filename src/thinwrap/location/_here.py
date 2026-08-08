@@ -9,7 +9,7 @@ from typing import Any, Callable, List, Mapping, Optional
 from urllib.parse import urlencode, urlparse
 
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
-from ._util import decode_json, iso_string, ok_status
+from ._util import decode_json, iso_seconds_string, iso_string, ok_status
 from ._waypoint_order import is_complete_waypoint_order
 from .base import BaseConnector
 from .config import HereConfig
@@ -211,8 +211,9 @@ class HereRoutingConnector(BaseConnector):
         }
         if opts.departure_time:
             # findsequence2 documents the departure-time param as `departure`
-            # (ISO 8601); `departureTime` is not recognized and was silently ignored.
-            query["departure"] = iso_string(opts.departure_time)
+            # (ISO 8601); `departureTime` is not recognized and was silently
+            # ignored. Seconds precision — the endpoint 400s on a fractional value.
+            query["departure"] = iso_seconds_string(opts.departure_time)
         for i, wp in enumerate(intermediates):
             query[f"destination{i + 1}"] = to_lat_lng_string(wp)
 
@@ -226,7 +227,16 @@ class HereRoutingConnector(BaseConnector):
         raw = decode_json(data)
         results = raw.get("results") if isinstance(raw, dict) else None
         if not results or not isinstance(results[0].get("waypoints"), list):
-            raise unknown_error(resp.status, raw, "HERE findsequence2 returned no sequence")
+            # The legacy WPS endpoint also reports a rejected request as HTTP 200
+            # with {"results": None, "errors": [...], "responseCode": "400"}, so
+            # the reason arrives here rather than through _here_http_error.
+            reason = _here_error_message(raw)
+            message = (
+                f"HERE findsequence2 returned no sequence: {reason}"
+                if reason
+                else "HERE findsequence2 returned no sequence"
+            )
+            raise unknown_error(resp.status, raw, message)
         entries = sorted(results[0]["waypoints"], key=lambda w: jnum(w.get("sequence")))
         last_index = len(wps) - 1
         absolute: List[int] = []
@@ -643,10 +653,24 @@ def _here_error_message(body: Any) -> str:
         return f"{title}: {cause}" if cause else title
     if cause:
         return cause
+    # findsequence2 is the legacy WPS shape — no title/cause, just
+    # {"results": None, "errors": ["Bad Format for Date and Time: …"],
+    #  "responseCode": "400"}. Without this the one statement of *why* is dropped
+    # and the caller sees a bare "failed: 400".
+    errors = _here_error_list(body.get("errors"))
+    if errors:
+        return errors
     em = jstr(jget(body.get("error"), "message"))
     if em:
         return em
     return jstr(body.get("message")) or jstr(body.get("error"))
+
+
+def _here_error_list(value: Any) -> str:
+    """Join the non-empty strings of a WPS ``errors`` array."""
+    if not isinstance(value, list):
+        return ""
+    return "; ".join(s for s in (jstr(item) for item in value) if s)
 
 
 def _here_http_error(status: int, headers, data: bytes) -> ConnectorError:

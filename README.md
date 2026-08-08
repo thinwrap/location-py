@@ -189,6 +189,12 @@ use `httpx`/`requests`/a traced client, implement the tiny `Transport` protocol
 and inject it — the library never imports a third-party HTTP client, so it stays
 zero-dependency:
 
+**Contract: a non-2xx must be RETURNED, not raised.** Each connector's status mapping
+(429 → `RATE_LIMITED`, 401 → `AUTH_FAILED`, …) reads the response, and the bundled
+`urllib` transport honours this. A transport calling `requests`/`httpx`
+`raise_for_status()` violates it, so that case is handled defensively — the response is
+rebuilt from the exception and classification still runs — but returning it is correct.
+
 ```python
 import httpx
 from thinwrap.location import Routing, GoogleConfig

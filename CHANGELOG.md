@@ -6,6 +6,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `HereTransportMode.BUS` — a distinct mode from `PRIVATE_BUS`, not a synonym.
+
+### Fixed
+
+- HERE optimized routing carrying a `departure_time` failed outright (regression in 1.2.0);
+  `findsequence2` rejects the millisecond `departure` it emitted.
+- A BYO `Transport` that raises on a non-2xx no longer collapses every HTTP error into
+  `provider_unavailable` with no status.
+- HERE `findsequence2` error text is no longer discarded; its legacy envelope is parsed.
+- Mapbox `depart_at` emitted a millisecond value Mapbox does not document. Now seconds.
+
+### Documentation
+
+- `TAXI` and `PRIVATE_BUS` were wrongly marked "routing only"; Matrix v8 accepts both.
+- HERE docs: `PRIVATE_BUS` is incompatible with `optimize=True` (`findsequence2` 400s), plus
+  `taxi[allowDriveThroughTaxiRoads]` and `networkRestrictedTruck` via `passthrough`.
+
 ## [1.2.0] — 2026-07-28
 
 One release carrying both the initial Python port and the 1.2.0 scope, so *Changed* and *Fixed*

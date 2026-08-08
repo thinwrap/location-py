@@ -18,7 +18,11 @@ class MatrixOptions:
     travel_mode: TravelMode = TravelMode.DRIVING
     avoid_tolls: bool = False
     departure_time: Optional[datetime] = None
-    transport_mode: Optional[HereTransportMode] = None  # HERE only
+    #: HERE-only augmentation; overrides the TravelMode mapping when set. Matrix
+    #: v8 accepts the same eight values as Routing v8 — including taxi, bus and
+    #: privateBus — and has no findsequence2 leg, so none of the optimization
+    #: caveats on :attr:`HereTransportMode.PRIVATE_BUS` apply here.
+    transport_mode: Optional[HereTransportMode] = None
     passthrough: Optional[Passthrough] = None
 
     #: Whether to compute cells against live traffic. Opt-in for the same reason as

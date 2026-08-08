@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import datetime as dt
+import types
+
 import pytest
-from helpers import FakeTransport, gzip_resp, no_sleep, qget, resp
+from helpers import FakeTransport, body_json, gzip_resp, no_sleep, qget, resp
 
 from thinwrap.location import (
     AutocompleteOptions,
@@ -42,6 +45,28 @@ def test_routing_transport_mode_override():
     assert qget(fake.last, "transportMode") == "truck"
 
 
+# bus and privateBus are distinct HERE modes, not synonyms: bus may use
+# bus-exclusive streets, privateBus only where a waypoint sits on one.
+@pytest.mark.parametrize("mode", [HereTransportMode.BUS, HereTransportMode.PRIVATE_BUS])
+def test_routing_bus_transport_modes(mode):
+    fake = FakeTransport(resp(200, '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":1,"duration":1}}]}]}'))
+    r = Routing(HereConfig("k"), transport=fake)
+    r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)], transport_mode=mode))
+    assert qget(fake.last, "transportMode") == mode.value
+
+
+# The mode is forwarded verbatim into the findsequence2 mode grammar. bus is
+# accepted there; privateBus is not, which is why it is documented as
+# incompatible with optimize rather than silently rewritten.
+def test_routing_optimized_bus_mode():
+    findseq = resp(200, '{"results":[{"waypoints":[{"id":"start","sequence":0},{"id":"end","sequence":1},{"id":"destination1","sequence":2}]}]}')
+    routes = resp(200, '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":10,"duration":20}}]}]}')
+    fake = FakeTransport(findseq, routes)
+    r = Routing(HereConfig("k"), transport=fake)
+    r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True, transport_mode=HereTransportMode.BUS))
+    assert qget(fake.calls[0], "mode") == "fastest;bus;traffic:disabled"
+
+
 def test_routing_optimized():
     findseq = resp(200, '{"results":[{"waypoints":[{"id":"start","sequence":0},{"id":"end","sequence":1},{"id":"destination1","sequence":2}]}]}')
     routes = resp(200, '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":10,"duration":20}}]}]}')
@@ -49,6 +74,81 @@ def test_routing_optimized():
     r = Routing(HereConfig("k"), transport=fake)
     res = r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True))
     assert res.waypoint_order == [0, 2, 1]
+
+
+def test_findsequence_departure_has_no_milliseconds():
+    """Live-verified wire grammar of the legacy WPS endpoint: findsequence2
+    answers 400 'Bad Format for Date and Time' to '2026-08-07T03:06:00.000Z' and
+    200 to '2026-08-07T03:06:00Z'. /v8/routes keeps the fractional form."""
+    findseq = resp(200, '{"results":[{"waypoints":[{"id":"start","sequence":0},{"id":"end","sequence":1},{"id":"destination1","sequence":2}]}]}')
+    routes = resp(200, '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":10,"duration":20}}]}]}')
+    fake = FakeTransport(findseq, routes)
+    departure = dt.datetime(2026, 8, 7, 3, 6, 0, 999_000, tzinfo=dt.timezone.utc)
+    Routing(HereConfig("k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True, departure_time=departure)
+    )
+
+    emitted = qget(fake.calls[0], "departure")
+    assert emitted == "2026-08-07T03:06:00Z"
+    assert "." not in emitted
+    assert qget(fake.calls[1], "departureTime") == "2026-08-07T03:06:00.999Z"
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        (400, "Bad Format for Date and Time"),
+        # The legacy endpoint also reports a rejection as HTTP 200 + responseCode.
+        (200, "returned no sequence: Bad Format for Date and Time"),
+    ],
+)
+def test_findsequence_surfaces_errors_array(status, expected):
+    body = '{"results":null,"errors":["Bad Format for Date and Time: 2026-08-07T03:06:00.000Z."],"responseCode":"400"}'
+    fake = FakeTransport(resp(status, body))
+    r = Routing(HereConfig("k"), transport=fake)
+    with pytest.raises(ConnectorError) as excinfo:
+        r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True))
+    assert expected in (excinfo.value.provider_message or "")
+
+
+def test_findsequence_maps_status_when_transport_raises_the_non_2xx():
+    """A BYO transport calling raise_for_status() must not collapse a 400 into
+    provider_unavailable: the provider answered, so the caller gets the real
+    status and the HERE message."""
+
+    class RaisingTransport:
+        """Shape of requests/httpx: the exception carries a `.response`, and its
+        message embeds the key-bearing URL."""
+
+        def send(self, request):
+            error = RuntimeError(f"400 Client Error for url: {request.url}")
+            error.response = types.SimpleNamespace(
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+                content=b'{"results":null,"errors":["Bad Format for Date and Time: x."],"responseCode":"400"}',
+            )
+            raise error
+
+    r = Routing(HereConfig("secret-key"), transport=RaisingTransport())
+    with pytest.raises(ConnectorError) as excinfo:
+        r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True))
+    error = excinfo.value
+    assert error.status_code == 400
+    assert error.provider_code is ProviderCode.INVALID_REQUEST
+    assert "Bad Format for Date and Time" in (error.provider_message or "")
+    assert "secret-key" not in repr(error)
+
+
+def test_transport_failure_without_a_status_stays_provider_unavailable():
+    class DeadTransport:
+        def send(self, request):
+            raise OSError("connection reset by peer")
+
+    r = Routing(HereConfig("k"), transport=DeadTransport())
+    with pytest.raises(ConnectorError) as excinfo:
+        r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)]))
+    assert excinfo.value.provider_code is ProviderCode.PROVIDER_UNAVAILABLE
+    assert excinfo.value.status_code is None
 
 
 _RESULT_URL = "https://aws-eu-west-1.matrix.router.hereapi.com/v8/matrix/mid/result"
@@ -94,6 +194,20 @@ def test_matrix_retrieve_direct_plain_body():
     c = res.cells[0]
     assert c.distance_meters == 109144 and c.duration_seconds == 5427
     assert len(fake.calls) == 3  # no S3 hop
+
+
+# Matrix v8 accepts the same eight transport modes as Routing v8 — verified live
+# for bus and privateBus, both HTTP 200 — so MatrixOptions takes the whole set,
+# not a routing-only subset.
+@pytest.mark.parametrize("mode", [HereTransportMode.TAXI, HereTransportMode.BUS, HereTransportMode.PRIVATE_BUS])
+def test_matrix_transport_mode(mode):
+    submit = resp(200, '{"matrixId":"mid","statusUrl":"https://matrix.router.hereapi.com/v8/matrix/mid/status"}')
+    poll = resp(200, '{"matrixId":"mid","status":"completed","resultUrl":"' + _RESULT_URL + '"}')
+    retrieve = resp(200, '{"matrixId":"mid","matrix":{"numOrigins":1,"numDestinations":1,"travelTimes":[1],"distances":[1]}}')
+    fake = FakeTransport(submit, poll, retrieve)
+    m = Matrix(HereConfig("k"), transport=fake, sleep=no_sleep)
+    m.matrix(MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(2, 2)], transport_mode=mode))
+    assert body_json(fake.calls[0])["transportMode"] == mode.value
 
 
 def test_matrix_rejects_foreign_host():

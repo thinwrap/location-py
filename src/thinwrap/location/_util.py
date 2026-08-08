@@ -61,3 +61,19 @@ def iso_string(when: _dt.datetime) -> str:
         when = when.replace(tzinfo=_dt.timezone.utc)
     utc = when.astimezone(_dt.timezone.utc)
     return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond // 1000:03d}Z"
+
+
+def iso_seconds_string(when: _dt.datetime) -> str:
+    """Format a datetime as ISO 8601 at *seconds* precision, zone designator
+    retained ('2026-08-07T03:06:00Z').
+
+    HERE's legacy WPS endpoint (findsequence2) rejects fractional seconds
+    outright — 'Bad Format for Date and Time', HTTP 400 — so the millisecond form
+    :func:`iso_string` produces breaks every optimized route carrying a departure
+    time. Precision is a property of the endpoint, not of the value: /v8/routes
+    accepts the fractional form and keeps using :func:`iso_string`.
+
+    Naive datetimes are interpreted as UTC, exactly as :func:`iso_string` does."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_dt.timezone.utc)
+    return when.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

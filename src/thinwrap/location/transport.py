@@ -46,7 +46,12 @@ class HttpResponse:
 class Transport(Protocol):
     """Send one request, return one response. Raise on transport failure
     (connection/DNS/timeout) — the connector normalizes that to
-    provider_unavailable. Non-2xx HTTP responses must be RETURNED, not raised."""
+    provider_unavailable. Non-2xx HTTP responses must be RETURNED, not raised.
+
+    That last rule is honoured defensively rather than assumed: a transport built
+    on ``requests``/``httpx`` calling ``raise_for_status()`` violates it, so
+    ``BaseConnector`` rebuilds the response from such an exception rather than
+    reporting the provider as unreachable."""
 
     def send(self, request: HttpRequest) -> HttpResponse: ...
 

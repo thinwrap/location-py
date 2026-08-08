@@ -27,15 +27,40 @@ class IsochroneType(str, Enum):
 
 class HereTransportMode(str, Enum):
     """HERE-narrowed transport mode. Set on RoutingOptions / MatrixOptions to
-    override the base TravelMode mapping; read only by the HERE connector."""
+    override the base TravelMode mapping; read only by the HERE connector.
+
+    Routing v8 and Matrix v8 publish the same eight values, so both options
+    classes take the whole set. HERE lists ``BICYCLE``, ``BUS`` and
+    ``PRIVATE_BUS`` as Beta with limited functionality.
+
+    HERE's routing enum has one further value, ``networkRestrictedTruck``, which
+    is deliberately absent: ``findsequence2`` and Matrix v8 both reject it, and
+    ``/v8/routes`` returns 400 ``Missing 'networkRestrictedTruck[permittedNetworks]'
+    parameter`` unless that companion parameter is supplied, which this connector
+    does not model. Reach it through ``passthrough.query`` if you need it.
+    """
 
     CAR = "car"
     TRUCK = "truck"
     PEDESTRIAN = "pedestrian"
     BICYCLE = "bicycle"
     SCOOTER = "scooter"
-    TAXI = "taxi"  # routing only
-    PRIVATE_BUS = "privateBus"  # routing only
+    TAXI = "taxi"
+
+    #: A public-service bus: may drive through bus-restricted and bus-exclusive
+    #: streets.
+    BUS = "bus"
+
+    #: A bus without those permissions: bus-exclusive streets are used only
+    #: where a waypoint sits on one, the pick-up / drop-off case. NOT a synonym
+    #: for ``BUS``.
+    #:
+    #: Incompatible with ``optimize=True``. Optimization runs through the legacy
+    #: ``findsequence2`` endpoint, whose ``mode`` grammar accepts only car,
+    #: truck, pedestrian, bus, bicycle, scooter and taxi; ``privateBus`` comes
+    #: back as HTTP 400 ``Unknown transport mode 'privateBus'``. Use ``BUS``
+    #: when you need optimization.
+    PRIVATE_BUS = "privateBus"
 
 
 class PolylineQuality(str, Enum):

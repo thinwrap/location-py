@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import math
 
 import pytest
@@ -72,6 +73,27 @@ def test_routing_optimized():
     assert qget(fake.last, "roundtrip") == "false"
     assert qget(fake.last, "source") == "first"
     assert qget(fake.last, "destination") == "last"
+
+
+@pytest.mark.parametrize("optimize,expected_prefix", [(False, "/directions/v5"), (True, "/optimized-trips/v1")])
+def test_depart_at_uses_a_documented_iso_form(optimize, expected_prefix):
+    """Mapbox enumerates exactly three accepted ISO 8601 forms for depart_at
+    (YYYY-MM-DDThh:mm:ssZ, ...±hh:mm, YYYY-MM-DDThh:mm); the millisecond form is
+    not one of them."""
+    pts = [LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)]
+    geom = encode_p6(pts)
+    body = (
+        '{"code":"Ok","trips":[{"geometry":"' + geom + '","legs":[{"distance":5,"duration":6}],"distance":5,"duration":6}],"waypoints":[{"waypoint_index":0},{"waypoint_index":1},{"waypoint_index":2}]}'
+        if optimize
+        else '{"code":"Ok","routes":[{"geometry":"' + geom + '","legs":[{"distance":5,"duration":6}],"distance":5,"duration":6}]}'
+    )
+    fake = FakeTransport(resp(200, body))
+    departure = dt.datetime(2026, 8, 7, 3, 6, 0, 750_000, tzinfo=dt.timezone.utc)
+    Routing(MapboxConfig("tok"), transport=fake).route(
+        RoutingOptions(waypoints=pts, optimize=optimize, departure_time=departure)
+    )
+    assert path_of(fake.last).startswith(expected_prefix)
+    assert qget(fake.last, "depart_at") == "2026-08-07T03:06:00Z"
 
 
 def test_routing_errors():
