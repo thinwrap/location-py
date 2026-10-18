@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List, Optional, Sequence
 
+from ._coerce import check_departure_type, coerce_enum, coerce_tokens
 from .enums import (
     HereTransportMode,
     PolylineQuality,
@@ -37,15 +38,39 @@ class RoutingOptions:
     #: a best-effort hint that HERE, TomTom and Esri silently ignore.
     polyline_quality: PolylineQuality = PolylineQuality.SIMPLIFIED
 
-    #: Whether to route against live traffic. Opt-in because traffic is a billable
-    #: upgrade on some providers — most notably Google, where it selects a Pro-tier
-    #: SKU — so it is NOT implied by ``departure_time``.
+    #: Whether to route against traffic (see :class:`TrafficMode`: ``NONE``,
+    #: ``TRAFFIC``, and the deprecated alias ``LIVE``). Opt-in because traffic is a
+    #: billable upgrade on some providers — most notably Google, where it selects
+    #: a Pro-tier SKU, and HERE, which bills routing as Time-Aware unless traffic
+    #: is disabled — so it is NOT implied by ``departure_time``: under ``NONE`` a
+    #: departure time never adds traffic.
     traffic_mode: TrafficMode = TrafficMode.NONE
 
     #: Optional normalized output fields to fetch. Empty means nothing extra is
     #: requested, so the response stays as small and as cheap as the provider
     #: allows.
     include: Sequence[RoutingInclude] = ()
+
+    def __post_init__(self) -> None:
+        """Normalize the closed-vocabulary fields to their enum members.
+
+        Raw valid strings (``travel_mode="walking"``) are accepted and normalized;
+        ``include`` becomes a tuple of :class:`RoutingInclude` members.
+        ``transport_mode`` is not checked: the HERE connector forwards it verbatim,
+        so HERE itself judges it.
+
+        Raises:
+            ValueError: ``travel_mode``, ``traffic_mode``, ``polyline_quality`` or an
+                ``include`` token is a string outside its enum.
+            TypeError: one of those is not a string (``None`` included), ``include``
+                is a bare string or not iterable, or ``departure_time`` is neither a
+                ``datetime`` nor a string.
+        """
+        coerce_enum(self, "travel_mode", TravelMode)
+        coerce_enum(self, "traffic_mode", TrafficMode)
+        coerce_enum(self, "polyline_quality", PolylineQuality)
+        coerce_tokens(self, "include", RoutingInclude)
+        check_departure_type(self)
 
     def includes(self, token: RoutingInclude) -> bool:
         """Whether the caller opted into a given optional output field."""

@@ -113,3 +113,44 @@ def test_validate_isochrone_cap():
     for bad in ([], [0], [-1], [math.nan], [1, 2, 3, 4, 5]):
         with pytest.raises(ConnectorError):
             validate_isochrone_cap(bad)
+
+
+def test_build_url_repeats_a_list_valued_key():
+    from thinwrap.location._util import build_url
+
+    assert build_url("https://h/p", {"avoid": ["tollRoads", "motorways"], "key": "k"}) == "https://h/p?avoid=tollRoads&avoid=motorways&key=k"
+    # A plain string is one value, never split into characters.
+    assert build_url("https://h/p", {"q": "a,b"}) == "https://h/p?q=a%2Cb"
+
+
+def test_passthrough_query_replaces_a_list_valued_connector_key():
+    _, _, q = merge_passthrough({}, {}, Passthrough(query={"avoid": "unpavedRoads"}), {"avoid": ["tollRoads"]})
+    assert q == {"avoid": "unpavedRoads"}
+
+
+def test_redact_credentials_masks_url_userinfo():
+    from thinwrap.location._util import redact_credentials, redact_url_userinfo
+
+    assert redact_credentials("GET https://alice:s3cret@host/x failed") == "GET https://[REDACTED]@host/x failed"
+    assert redact_url_userinfo("https://alice:s3cret@host:8443/osrm") == "https://[REDACTED]@host:8443/osrm"
+    assert redact_url_userinfo("alice:s3cret@host") == "[REDACTED]@host"
+    assert redact_url_userinfo("https://host/path@x") == "https://host/path@x"
+
+
+@pytest.mark.parametrize("url", ["http://localhost:5000/route", "file:///etc/passwd", "ftp://h/x", "host-only"])
+def test_default_transport_refuses_non_https_with_invalid_request(url):
+    from thinwrap.location.transport import HttpRequest, UrllibTransport
+
+    with pytest.raises(ConnectorError) as ei:
+        UrllibTransport().send(HttpRequest(method="GET", url=url))
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+    assert "Transport" in str(ei.value)
+
+
+def test_config_reprs_hide_secrets():
+    from thinwrap.location import GoogleConfig
+
+    assert "g-secret" not in repr(GoogleConfig("g-secret"))
+    assert "g-secret" not in str(GoogleConfig(api_key="g-secret"))
+    # Equality still sees the secret, so two configs with different keys differ.
+    assert GoogleConfig("a") != GoogleConfig("b")

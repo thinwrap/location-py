@@ -193,3 +193,170 @@ def test_compact_json_rejects_nonfinite(bad):
 
 def test_compact_json_finite_still_works():
     assert compact_json({"a": 1, "b": "x"}) == b'{"a":1,"b":"x"}'
+
+
+# --- decode_json rejects the non-JSON NaN/Infinity tokens ---------------------
+
+@pytest.mark.parametrize("token", [b"NaN", b"Infinity", b"-Infinity"])
+def test_decode_json_rejects_nonfinite_tokens(token):
+    from thinwrap.location._util import decode_json
+
+    assert decode_json(b'{"distance": ' + token + b"}") is None
+
+
+def test_nan_in_a_vendor_body_is_an_error_not_a_nan_distance():
+    body = '{"code":"Ok","routes":[{"distance":NaN,"duration":1,"geometry":"","legs":[{"distance":1,"duration":1}]}]}'
+    with pytest.raises(ConnectorError) as ei:
+        Routing(MapboxConfig("pk"), transport=FakeTransport(resp(200, body))).route(
+            RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)])
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+# --- passthrough headers replace connector headers case-insensitively ----------
+
+def test_passthrough_header_replaces_connector_header_regardless_of_case():
+    from thinwrap.location import Passthrough
+
+    fake = FakeTransport(resp(200, '{"routes":[{"distanceMeters":1,"duration":"1s","legs":[{"distanceMeters":1,"duration":"1s"}]}]}'))
+    Routing(GoogleConfig("k"), transport=fake).route(
+        RoutingOptions(
+            waypoints=[LatLng(1, 1), LatLng(2, 2)],
+            passthrough=Passthrough(headers={"x-goog-fieldmask": "routes.distanceMeters"}),
+        )
+    )
+    sent = {k: v for k, v in fake.last.headers.items() if k.lower() == "x-goog-fieldmask"}
+    # One header, the caller's spelling and value.
+    assert sent == {"x-goog-fieldmask": "routes.distanceMeters"}
+
+
+def test_passthrough_content_type_replaces_the_connectors():
+    from thinwrap.location import Passthrough
+
+    fake = FakeTransport(resp(200, '{"suggestions":[]}'))
+    Geocoding(GoogleConfig("k"), transport=fake).autocomplete(
+        AutocompleteOptions(input="x", passthrough=Passthrough(headers={"content-type": "application/json; charset=utf-8"}))
+    )
+    sent = {k: v for k, v in fake.last.headers.items() if k.lower() == "content-type"}
+    assert sent == {"content-type": "application/json; charset=utf-8"}
+
+
+# --- timeoutMs: a finite number of milliseconds > 0, else invalid_request ------
+
+_MATRIX_TWO_BY_TWO = dict(origins=[LatLng(1, 1), LatLng(1, 2)], destinations=[LatLng(2, 1), LatLng(2, 2)])
+
+
+@pytest.mark.parametrize("bad", ["5000", float("nan"), float("inf"), 0, -1, True, None, [1]])
+@pytest.mark.parametrize("cfg", [HereConfig("k"), TomTomConfig("k")])
+def test_timeout_ms_rejects_anything_but_a_positive_finite_number(cfg, bad):
+    from thinwrap.location import Passthrough
+
+    fake = FakeTransport()
+    with pytest.raises(ConnectorError) as ei:
+        Matrix(cfg, transport=fake, sleep=no_sleep).matrix(
+            MatrixOptions(**_MATRIX_TWO_BY_TWO, passthrough=Passthrough(body={"timeoutMs": bad}))
+        )
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+    assert fake.calls == []
+
+
+def test_timeout_ms_accepts_a_fractional_number():
+    from thinwrap.location.passthrough import Passthrough
+    from thinwrap.location.poll import extract_timeout_ms
+
+    deadline, clean = extract_timeout_ms(Passthrough(body={"timeoutMs": 1500.5, "keep": 1}))
+    assert deadline == 1.5005
+    assert clean.body == {"keep": 1}
+
+
+# --- a 2xx body the connector cannot interpret is `unknown`, not zero results --
+
+@pytest.mark.parametrize("cfg", [GoogleConfig("k"), HereConfig("k"), MapboxConfig("pk"), TomTomConfig("k"), EsriConfig(api_key="k")])
+@pytest.mark.parametrize("body", ["", "<html>busy</html>", "[]", '{"unexpected": true}'])
+def test_geocode_uninterpretable_2xx_body_is_unknown(cfg, body):
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(cfg, transport=FakeTransport(resp(200, body))).geocode(GeocodeOptions(address="x"))
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+    assert ei.value.status_code == 200
+
+
+@pytest.mark.parametrize("cfg,body", [
+    (GoogleConfig("k"), '{"status":"ZERO_RESULTS","results":[]}'),
+    (HereConfig("k"), '{"items":[]}'),
+    (MapboxConfig("pk"), '{"type":"FeatureCollection","features":[]}'),
+    (TomTomConfig("k"), '{"results":[]}'),
+    (EsriConfig(api_key="k"), '{"candidates":[]}'),
+])
+def test_geocode_well_formed_zero_results_stays_empty(cfg, body):
+    result = Geocoding(cfg, transport=FakeTransport(resp(200, body))).geocode(GeocodeOptions(address="x"))
+    assert result.candidates == []
+
+
+@pytest.mark.parametrize("cfg", [GoogleConfig("k"), HereConfig("k"), MapboxConfig("pk"), TomTomConfig("k"), EsriConfig(api_key="k")])
+def test_autocomplete_uninterpretable_2xx_body_is_unknown(cfg):
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(cfg, transport=FakeTransport(resp(200, "<html/>"))).autocomplete(
+            AutocompleteOptions(input="x", location=LatLng(1, 1))
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+def test_google_autocomplete_empty_object_is_zero_results():
+    # proto3 JSON drops an empty repeated field: no predictions arrive as `{}`.
+    result = Geocoding(GoogleConfig("k"), transport=FakeTransport(resp(200, "{}"))).autocomplete(
+        AutocompleteOptions(input="x")
+    )
+    assert result.predictions == []
+
+
+# --- a partial viewport is omitted, never 0-filled -----------------------------
+
+@pytest.mark.parametrize("cfg,body", [
+    (HereConfig("k"), '{"items":[{"address":{"label":"a"},"position":{"lat":1,"lng":2},"mapView":{"south":1,"west":2,"north":3}}]}'),
+    (TomTomConfig("k"), '{"results":[{"address":{"freeformAddress":"a"},"position":{"lat":1,"lon":2},"viewport":{"topLeftPoint":{"lat":3},"btmRightPoint":{"lat":1,"lon":4}}}]}'),
+    (EsriConfig(api_key="k"), '{"candidates":[{"address":"a","location":{"x":2,"y":1},"extent":{"xmin":1,"ymin":1,"xmax":3}}]}'),
+    (MapboxConfig("pk"), '{"features":[{"geometry":{"coordinates":[2,1]},"properties":{"full_address":"a","bbox":[1,1,null,3]}}]}'),
+])
+def test_partial_viewport_is_omitted(cfg, body):
+    result = Geocoding(cfg, transport=FakeTransport(resp(200, body))).geocode(GeocodeOptions(address="x"))
+    assert len(result.candidates) == 1
+    assert result.candidates[0].viewport is None
+
+
+def test_mapbox_feature_with_non_numeric_coordinates_is_skipped():
+    body = '{"features":[{"geometry":{"coordinates":["2",1]},"properties":{"full_address":"a"}}]}'
+    result = Geocoding(MapboxConfig("pk"), transport=FakeTransport(resp(200, body))).geocode(GeocodeOptions(address="x"))
+    assert result.candidates == []
+
+
+# --- Esri reverseGeocode "no address here" is the zero-results answer ----------
+
+def test_esri_reverse_geocode_unable_to_find_address_returns_empty():
+    body = (
+        '{"error":{"code":400,"message":"Cannot perform query. Invalid query parameters.",'
+        '"details":["Unable to find address for the specified location."]}}'
+    )
+    result = Geocoding(EsriConfig(api_key="k"), transport=FakeTransport(resp(200, body))).reverse_geocode(
+        ReverseGeocodeOptions(location=LatLng(0, -30))
+    )
+    assert result.candidates == []
+    assert result.raw["error"]["code"] == 400
+
+
+def test_esri_reverse_geocode_other_400_is_still_invalid_request():
+    body = '{"error":{"code":400,"message":"Invalid location","details":[]}}'
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(EsriConfig(api_key="k"), transport=FakeTransport(resp(200, body))).reverse_geocode(
+            ReverseGeocodeOptions(location=LatLng(0, -30))
+        )
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+
+
+def test_a_route_with_no_legs_carries_the_http_status():
+    body = '{"code":"Ok","routes":[{"distance":1,"duration":1,"geometry":"","legs":[]}]}'
+    with pytest.raises(ConnectorError) as ei:
+        Routing(MapboxConfig("pk"), transport=FakeTransport(resp(200, body))).route(
+            RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)])
+        )
+    assert ei.value.provider_code == ProviderCode.NO_ROUTE
+    assert ei.value.status_code == 200

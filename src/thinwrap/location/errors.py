@@ -47,7 +47,16 @@ class ProviderCode(str, Enum):
 
 
 class ConnectorError(Exception):
-    """The single typed error every operation can raise.
+    """The typed error for every operation failure: a vendor error, a transport
+    failure or timeout, request data rejected before sending (``status_code``
+    ``None``), or a capability rejection (``unsupported_*``).
+
+    Misuse of the API is NOT a ``ConnectorError``: it raises the native exception
+    as early as possible — ``TypeError`` for a non-config, a transport without
+    ``send()`` or a wrong argument type; ``ValueError`` for a provider lacking the
+    operation or a string outside a closed vocabulary (``travel_mode="flying"``).
+    Folding those in would make a bug in the calling code look like bad end-user
+    input (``invalid_request``) or, worse, a retryable outage.
 
     There is deliberately no ``retry_after_seconds`` attribute: the raw
     ``Retry-After`` header rides in ``cause['retryAfter']`` and its parsed
@@ -138,3 +147,21 @@ def provider_error(
         provider_message=redact_credentials(msg) if msg else msg,
         cause=_redact_cause(cause),
     )
+
+
+def require_list(status: int, raw: Any, key: str, label: str, *, missing_ok: bool = False) -> list:
+    """The list under ``raw[key]`` of a 2xx body, or an ``unknown`` error.
+
+    A body that is not a JSON object, or whose result list is absent or not a list,
+    is a response the connector cannot interpret — returning an empty result for it
+    would present an outage or a truncated body as a genuine "no results" answer.
+    ``missing_ok`` is for vendors whose JSON drops an empty list entirely (Google's
+    proto3 JSON omits empty repeated fields), where absence IS the zero-results
+    answer."""
+    if isinstance(raw, dict):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return value
+        if value is None and missing_ok:
+            return []
+    raise unknown_error(status, raw, f"{label} returned a malformed response body (no {key} list)")

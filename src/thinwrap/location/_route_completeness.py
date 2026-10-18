@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .errors import ConnectorError, ProviderCode
 
 
-def assert_route_has_legs(actual_legs: int, waypoint_count: int, provider: str, raw: Any) -> None:
+def assert_route_has_legs(
+    actual_legs: int, waypoint_count: int, provider: str, raw: Any, status: Optional[int] = None
+) -> None:
     """Verify a routing response carries any route detail at all.
 
     This is the connector-side answer to *"expose waypoints[] so I can check the
@@ -31,4 +33,4 @@ def assert_route_has_legs(actual_legs: int, waypoint_count: int, provider: str, 
         return
 
     msg = f"{provider} returned a route with no legs for {waypoint_count} waypoints"
-    raise ConnectorError(ProviderCode.NO_ROUTE, message=msg, provider_message=msg, cause=raw)
+    raise ConnectorError(ProviderCode.NO_ROUTE, status_code=status, message=msg, provider_message=msg, cause=raw)

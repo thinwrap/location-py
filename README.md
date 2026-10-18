@@ -17,7 +17,7 @@ Requires Python ≥ 3.10. No runtime dependencies.
 ```python
 from thinwrap.location import Routing, RoutingOptions, GoogleConfig, LatLng, ConnectorError
 
-r = Routing(GoogleConfig(api_key="..."))
+r = Routing(GoogleConfig(api_key="..."))  # misuse raises TypeError/ValueError here, not ConnectorError
 try:
     res = r.route(RoutingOptions(waypoints=[
         LatLng(40.7128, -74.0060),  # New York
@@ -31,7 +31,8 @@ except ConnectorError as e:
 ## Operations & providers
 
 The **config type selects the provider**. An operation a provider does not
-support raises `ValueError` at facade construction (e.g. `Geocoding(OsrmConfig(...))`).
+support raises `ValueError` at facade construction (e.g. `Geocoding(OsrmConfig(...))`);
+anything that is not a provider config raises `TypeError` (see [Error handling](#error-handling)).
 
 | Facade | Method(s) | Providers |
 |---|---|---|
@@ -55,7 +56,7 @@ same request. All three default to the lean option; you opt up explicitly.
 | Option | Default | What it changes |
 |---|---|---|
 | `polyline_quality` | `PolylineQuality.SIMPLIFIED` | Geometry fidelity. `DETAILED` returned a **30x larger** polyline on Mapbox and **31x** on OSRM in measurement, with identical distances and durations. Honoured by Google/Mapbox/OSRM; silently ignored by HERE/TomTom/Esri. |
-| `traffic_mode` | `TrafficMode.NONE` | Whether to route against live traffic. `LIVE` selects a **Pro-tier SKU** on Google, so it is never enabled implicitly — not even by passing `departure_time`. |
+| `traffic_mode` | `TrafficMode.NONE` | Whether to route against traffic (see [Traffic](#traffic-none-vs-traffic)). `TRAFFIC` selects a **Pro-tier SKU** on Google and HERE's **Time-Aware Routing** rate, so it is never enabled implicitly — not even by passing `departure_time`. `LIVE` is a deprecated alias of `TRAFFIC`. |
 | `include` | `()` | Which optional output fields to fetch. Each token maps 1:1 onto one optional result field. |
 
 ```python
@@ -63,7 +64,7 @@ from thinwrap.location import PolylineQuality, RoutingInclude, RoutingOptions, T
 
 result = routing.route(RoutingOptions(
     waypoints=waypoints,
-    traffic_mode=TrafficMode.LIVE,                             # traffic-aware routing
+    traffic_mode=TrafficMode.TRAFFIC,                          # traffic-aware routing
     polyline_quality=PolylineQuality.DETAILED,                 # full geometry
     include=[RoutingInclude.DURATION_WITHOUT_TRAFFIC],         # the extra output field
 ))
@@ -80,6 +81,24 @@ congestion = (
 `DURATION_WITHOUT_TRAFFIC` is native on Google (`staticDuration`), HERE
 (`baseDuration`) and TomTom (`noTrafficTravelTimeInSeconds`); Mapbox, OSRM and Esri do
 not return it, so the field stays `None` there rather than being faked.
+
+### Traffic: `NONE` vs `TRAFFIC`
+
+`traffic_mode` applies to routing and matrix. `NONE` (the default) uses the provider's
+time-independent speeds, and a `departure_time` never adds traffic. `TRAFFIC` uses the
+traffic expected at `departure_time`: live close to now, typical later, and now when
+no time is given. `LIVE` is a deprecated alias of `TRAFFIC` and behaves identically.
+
+| Provider | `NONE` | `TRAFFIC` |
+|---|---|---|
+| Google | `TRAFFIC_UNAWARE`; the time is not sent (Google rejects it there) | `TRAFFIC_AWARE` + time (**Pro SKU**) |
+| HERE | `departureTime=any`, or the time + `traffic[mode]=disabled` | HERE's default, with the time if given (**Time-Aware SKU** on routing) |
+| Esri | the time is not sent | the time, or `now` |
+| Mapbox Directions | `driving`, the time is not sent | `driving-traffic` + time |
+| Mapbox Matrix | `driving`, the time is not sent | `driving-traffic`; driving with a time → `unsupported_field` (`depart_at` is a beta) |
+| TomTom routing | `traffic=false` + time. **Approximate:** TomTom still applies typical traffic | `traffic=true` + time |
+| TomTom matrix | `historical` + `departAt: "any"` (the time is not sent) | `live` + the time, or `"now"` |
+| OSRM, Mapbox Optimization, walking/cycling | no traffic | **ignored** (no traffic available). Mapbox Optimization driving + time → `unsupported_field` |
 
 ### Making OSRM's avoid-flags work
 
@@ -121,6 +140,13 @@ details = geocoding.place_details(PlaceDetailsOptions(place_id=predictions[0].pl
 
 `place_id` values are **provider-scoped** — a Google place id is meaningless to Mapbox.
 
+`details.candidate` is `None` when the provider does not know the id (HERE and Mapbox
+answer 404, TomTom and Esri an empty result, Google a 404 `NOT_FOUND`) or returns the place
+without a location — ids expire and places close, so check for it. `raw` still carries the
+vendor body. An id the vendor rejects as invalid is still an `invalid_request` error — and
+Google answers most unknown ids that way (400 `INVALID_ARGUMENT`, the same as a malformed
+one), as does Esri for a stale `magicKey`.
+
 ### Two things that cost money here
 
 **Google's Place Details SKU is driven by the field mask**, so `name` (`displayName`) is
@@ -143,13 +169,13 @@ token:
 ```python
 token = uuid.uuid4().hex   # one per user interaction
 
-mapbox.autocomplete(AutocompleteOptions(
-    input=text, passthrough=Passthrough(query={"session_token": token})
-))
+mapbox.autocomplete(AutocompleteOptions(input=text, session_token=token))
 mapbox.place_details(PlaceDetailsOptions(place_id=place_id, session_token=token))
 ```
 
-The wrapper cannot generate or remember that token — it holds no state.
+The wrapper cannot remember that token across calls — it holds no state. Mapbox requires
+`session_token` on both calls, so when you omit it the connector generates a fresh UUIDv4 for
+that one call, which is valid but billed as its own session.
 
 ### `structured_format` support
 
@@ -172,7 +198,7 @@ from thinwrap.location import Routing, MapboxConfig, HereConfig, OsrmConfig
 # Same .route(opts) call, same RoutingResult — only the config changes.
 mapbox = Routing(MapboxConfig(access_token=token))
 here   = Routing(HereConfig(api_key=key))
-osrm   = Routing(OsrmConfig(base_url="http://localhost:5000"))
+osrm   = Routing(OsrmConfig(base_url="https://osrm.example.com"))
 ```
 
 ## Normalized surface
@@ -180,14 +206,19 @@ osrm   = Routing(OsrmConfig(base_url="http://localhost:5000"))
 Distances are **meters**, durations are **seconds**, coordinates are `LatLng(lat, lng)`
 (lat-first), and route geometry is a **Google precision-5 polyline** string. Every
 result carries a `raw` escape hatch holding the decoded vendor body. Isochrone
-contour geometry is a GeoJSON `Polygon`.
+contour geometry is a GeoJSON `Polygon` (`[exterior, *holes]`, rings closed, exterior
+counter-clockwise and holes clockwise per RFC 7946), or a `MultiPolygon` when the provider
+returns a contour in several disconnected parts (islands, areas joined only by a ferry) —
+check `geometry.type` before reading `coordinates`.
 
 ## Sync + bring your own HTTP client
 
-The default transport is standard-library `urllib` (never follows redirects). To
-use `httpx`/`requests`/a traced client, implement the tiny `Transport` protocol
-and inject it — the library never imports a third-party HTTP client, so it stays
-zero-dependency:
+The default transport is standard-library `urllib` (never follows redirects) and is
+**HTTPS-only**: an `http://` URL — e.g. a self-hosted OSRM at `http://localhost:5000` —
+is refused with `ConnectorError` (`invalid_request`) before any network I/O. To reach a
+cleartext endpoint, or to use `httpx`/`requests`/a traced client, implement the tiny
+`Transport` protocol and inject it — the library never imports a third-party HTTP
+client, so it stays zero-dependency:
 
 **Contract: a non-2xx must be RETURNED, not raised.** Each connector's status mapping
 (429 → `RATE_LIMITED`, 401 → `AUTH_FAILED`, …) reads the response, and the bundled
@@ -218,12 +249,31 @@ single `matrix` call.)
 
 Forward vendor-specific fields the normalized input doesn't expose via
 `Passthrough`. `body` is deep-merged into the request body; `headers`/`query` are
-shallow-merged. Consumer values win (including over connector-set values).
+shallow-merged. Consumer values win (including over connector-set values). Header names
+match case-insensitively, as HTTP defines them: your `x-goog-fieldmask` replaces the
+connector's `X-Goog-FieldMask` and is sent in your spelling.
 
 ```python
 from thinwrap.location import Passthrough
 r.route(RoutingOptions(waypoints=wps, passthrough=Passthrough(query={"alternatives": "true"})))
 ```
+
+A list-valued vendor parameter the connector already sets — Google's `X-Goog-FieldMask`, HERE
+routing's `return`, a matrix `annotations` list, Esri's `accumulateAttributeNames` — is
+**replaced** by your value, not merged, so you can also remove a default. To append instead, start from the published default the connector itself sends:
+
+```python
+from thinwrap.location import GOOGLE_ROUTES_FIELD_MASK
+mask = ",".join(GOOGLE_ROUTES_FIELD_MASK + ("routes.travelAdvisory",))
+r.route(RoutingOptions(waypoints=wps, passthrough=Passthrough(headers={"X-Goog-FieldMask": mask})))
+```
+
+The full set of constants, and which normalized outputs each field feeds, is in the
+"Replacing a default list" section of the [Google](docs/providers/google.md#replacing-a-default-list),
+[HERE](docs/providers/here.md#replacing-a-default-list),
+[Esri](docs/providers/esri.md#replacing-a-default-list),
+[Mapbox](docs/providers/mapbox.md#replacing-a-default-list) and
+[OSRM](docs/providers/osrm.md#replacing-a-default-list) provider docs.
 
 ## Polyline utilities
 
@@ -235,8 +285,27 @@ from thinwrap.location import encode_polyline, decode_polyline, decode_flex_poly
 
 ## Error handling
 
-Every failure is a `ConnectorError` carrying a typed `ProviderCode`: the 6
-canonical values (`invalid_recipient`, `rate_limited`, `auth_failed`,
+Every **operation** failure is a `ConnectorError` carrying a typed `ProviderCode`: a
+vendor error, a transport failure, a timeout, request data the library rejects before
+sending (non-finite coordinates, too few waypoints, an empty matrix, a malformed
+country code, an unparseable date, …) or a capability the provider lacks
+(`unsupported_*`). Pre-flight rejections have `status_code` `None`. Compose your retry
+strategy from `provider_code` and `cause`.
+
+Misusing the API is a bug in your code, so it raises the native exception as early as
+possible and is deliberately **not** a `ConnectorError`:
+
+- `ValueError` — the provider lacks the operation; a string outside a closed vocabulary
+  (`travel_mode="flying"`, `traffic_mode`, `polyline_quality`, an `include` token,
+  isochrone `type`), raised when the options are constructed. Valid raw strings such as
+  `"walking"` are accepted.
+- `TypeError` — `None` or a non-config argument, a `transport` without `send()`, a wrong
+  argument type (e.g. a `str` routing/matrix `departure_time` on any provider but Esri).
+
+HERE's `transport_mode` is forwarded verbatim, so HERE judges it and a bad value is a
+`ConnectorError`.
+
+`ProviderCode` has the 6 canonical values (`invalid_recipient`, `rate_limited`, `auth_failed`,
 `provider_unavailable`, `invalid_request`, `unknown`) plus 7 location-extended
 (`unsupported_field`, `unsupported_option`, `unsupported_travel_mode`,
 `profile_not_configured`, `matrix_polling_timeout`, `no_route`, `timeout`) —

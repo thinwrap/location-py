@@ -45,7 +45,8 @@ One operation = one connector class per provider, in the provider's module
 3. **Dispatch** — add the `isinstance` arm to the relevant facade(s) in
    [`facades.py`](../src/thinwrap/location/facades.py). An unsupported (provider,
    operation) pair falls through to a `ValueError` — the runtime analog of the
-   sibling libraries' compile-time provider unions.
+   sibling libraries' compile-time provider unions; a non-config is caught first
+   as a `TypeError` by `_require_config`.
 4. **Export** — add public types to [`__init__.py`](../src/thinwrap/location/__init__.py) `__all__`.
 5. **Tests** — `tests/test_<provider>.py`; inject `helpers.FakeTransport` via the
    facade's `transport=` argument; async-matrix tests pass `sleep=no_sleep`.
@@ -74,5 +75,7 @@ python -c "import thinwrap.location"                 # offline import smoke
 - **OSRM** requires an explicit `base_url`, validated before any HTTP, at the top of
   each operation rather than in the facade constructor.
 - **Python idioms:** synchronous API; a bring-your-own `Transport` protocol
-  (default = stdlib `urllib`, never follows redirects); errors raised as
-  `ConnectorError`.
+  (default = stdlib `urllib`, never follows redirects); operation failures raised
+  as `ConnectorError`, API misuse as `TypeError`/`ValueError` (the two-bucket rule
+  in [`CONVENTIONS.md`](./CONVENTIONS.md#two-kinds-of-failure); pinned by
+  `tests/test_error_contract.py`).

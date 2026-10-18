@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
+from ._util import redact_url_userinfo
 from .enums import ProviderID
+
+# Secret-bearing fields are declared repr=False so a config that lands in a log line,
+# a traceback's locals or an error report does not carry the credential with it.
 
 
 @dataclass(frozen=True)
 class GoogleConfig:
     """Google provider (routing, matrix, geocoding)."""
 
-    api_key: str
+    api_key: str = field(repr=False)
 
     @property
     def provider_id(self) -> ProviderID:
@@ -23,7 +27,7 @@ class GoogleConfig:
 class MapboxConfig:
     """Mapbox provider (all four operations)."""
 
-    access_token: str
+    access_token: str = field(repr=False)
 
     @property
     def provider_id(self) -> ProviderID:
@@ -34,7 +38,7 @@ class MapboxConfig:
 class HereConfig:
     """HERE provider (all four operations)."""
 
-    api_key: str
+    api_key: str = field(repr=False)
 
     @property
     def provider_id(self) -> ProviderID:
@@ -46,8 +50,8 @@ class EsriConfig:
     """ESRI/ArcGIS provider (all four operations). Provide exactly one of
     api_key or arcgis_token."""
 
-    api_key: str = ""
-    arcgis_token: str = ""
+    api_key: str = field(default="", repr=False)
+    arcgis_token: str = field(default="", repr=False)
 
     @property
     def provider_id(self) -> ProviderID:
@@ -81,6 +85,14 @@ class OsrmConfig:
     #: no state to cache such a probe in.
     supported_exclude_classes: Sequence[str] = ()
 
+    def __repr__(self) -> str:
+        # Kept (unlike an API key) because the host is what makes a repr useful —
+        # only the userinfo of a basic-auth URL is secret, so only that is masked.
+        return (
+            f"OsrmConfig(base_url={redact_url_userinfo(self.base_url)!r}, "
+            f"supported_exclude_classes={self.supported_exclude_classes!r})"
+        )
+
     @property
     def provider_id(self) -> ProviderID:
         return ProviderID.OSRM
@@ -90,7 +102,7 @@ class OsrmConfig:
 class TomTomConfig:
     """TomTom provider (all four operations)."""
 
-    api_key: str
+    api_key: str = field(repr=False)
 
     @property
     def provider_id(self) -> ProviderID:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence
 
+from ._coerce import coerce_tokens
 from .enums import PlaceDetailsInclude
 from .latlng import LatLng
 from .passthrough import Passthrough
@@ -36,15 +37,16 @@ class AutocompleteOptions:
     #: Groups this keystroke with the rest of one user interaction, closed by the
     #: ``place_details()`` call carrying the SAME value.
     #:
-    #: Google-only here: Places Autocomplete is billed per SESSION when a token ties
-    #: the keystroke requests to the details call that closes them, and per REQUEST
-    #: when it does not — so omitting it on a keystroke-driven UI multiplies the bill
-    #: by the number of characters typed. Google documents a v4 UUID.
+    #: Honoured by Google and Mapbox. Both bill the autocomplete leg per SESSION when
+    #: a token ties the keystroke requests to the details call that closes them —
+    #: Google per REQUEST without one, and Mapbox Search Box treats every distinct
+    #: ``session_token`` as its own session — so a keystroke-driven UI without a
+    #: shared token multiplies the bill by the number of characters typed. Both
+    #: vendors document a v4 UUID. Mapbox requires the parameter, so when it is
+    #: omitted there the connector generates a UUIDv4 for that single call.
     #:
     #: The wrapper holds no state and cannot correlate the calls, so generating and
     #: threading the value is the caller's job. Ignored by every other provider.
-    #: (Mapbox needs the same concept but only on ``place_details()``, because its
-    #: ``suggest`` leg generates its own token.)
     session_token: Optional[str] = None
 
     passthrough: Optional[Passthrough] = None
@@ -179,6 +181,17 @@ class PlaceDetailsOptions:
 
     passthrough: Optional[Passthrough] = None
 
+    def __post_init__(self) -> None:
+        """Normalize ``include`` to a tuple of :class:`PlaceDetailsInclude` members
+        (raw valid strings are accepted).
+
+        Raises:
+            ValueError: an ``include`` token is a string outside the enum.
+            TypeError: ``include`` is a bare string or not iterable, or a token is
+                not a string.
+        """
+        coerce_tokens(self, "include", PlaceDetailsInclude)
+
     def includes(self, token: PlaceDetailsInclude) -> bool:
         """Whether the caller opted into a given optional output field."""
         return token in self.include
@@ -193,16 +206,24 @@ class PlaceDetailsResult:
     result straight into whatever already consumes geocode candidates.
     """
 
-    candidate: GeocodeCandidate
+    #: The resolved place, or ``None`` when the provider does not know the id or
+    #: returns the place without a usable location.
+    #:
+    #: An id that resolves to nothing is an answer, not a failure — ids expire and
+    #: places close — so it is reported the way geocoding reports zero results,
+    #: with ``raw`` still carrying the vendor body. An id the vendor rejects as
+    #: invalid is still an ``invalid_request`` error — Google's ``INVALID_ARGUMENT``,
+    #: which it also returns for most unknown ids.
+    candidate: Optional[GeocodeCandidate]
 
     #: The place's display name, when the provider returns one distinct from the
     #: formatted address (e.g. "Blue Bottle Coffee" vs its street address).
     #:
-    #: None on providers that only return an address (Esri), and on Google unless
-    #: ``PlaceDetailsInclude.NAME`` was requested — its Place Details SKU tier is
-    #: driven by the field mask, and ``displayName`` is a Pro-tier field. Note this
-    #: is the OPPOSITE of Compute Routes, whose SKU is feature-driven: check per API,
-    #: do not generalize.
+    #: None when ``candidate`` is None, on providers that only return an address
+    #: (Esri), and on Google unless ``PlaceDetailsInclude.NAME`` was requested —
+    #: its Place Details SKU tier is driven by the field mask, and ``displayName``
+    #: is a Pro-tier field. Note this is the OPPOSITE of Compute Routes, whose SKU
+    #: is feature-driven: check per API, do not generalize.
     name: Optional[str] = None
 
     raw: Any = None

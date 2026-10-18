@@ -85,16 +85,35 @@ class PolylineQuality(str, Enum):
 
 
 class TrafficMode(str, Enum):
-    """How much traffic data a route is computed against.
+    """How much traffic data a route or matrix is computed against.
+
+    - ``NONE`` (default) — no time-of-day traffic: durations use the provider's
+      time-independent speeds (its static model, not necessarily free-flow). A
+      ``departure_time`` NEVER adds traffic under ``NONE``.
+    - ``TRAFFIC`` — the traffic expected at ``departure_time``: live when that is
+      close to now, typical/predicted for later times; with no
+      ``departure_time``, now.
+    - ``LIVE`` — **deprecated** alias of ``TRAFFIC`` with identical behaviour. It
+      is kept permanently (no runtime warning) because it is public vocabulary;
+      prefer ``TRAFFIC`` in new code.
+
+    Where a provider cannot honour this exactly (TomTom routing under ``NONE``
+    still applies typical traffic; OSRM, Mapbox Optimization and
+    walking/cycling ignore traffic), its provider doc says so.
 
     ``NONE`` is the default, and that default is a **billing** decision as much as
     a correctness one: on Google, traffic-aware routing is a Pro-tier SKU feature
     while the base tier is Essentials, so a wrapper that quietly turns traffic on
-    moves the consumer to a more expensive SKU. Traffic is therefore always opt-in
-    — notably NOT implied by passing a ``departure_time``.
+    moves the consumer to a more expensive SKU. HERE is the same story in a
+    different shape: it applies live traffic whenever no departure time is sent,
+    and bills routing as Time-Aware Routing unless the request disables traffic
+    explicitly, so ``NONE`` makes the HERE connectors send that switch. Traffic is
+    therefore always opt-in — notably NOT implied by passing a ``departure_time``.
     """
 
     NONE = "none"
+    TRAFFIC = "traffic"
+    #: Deprecated: alias of :attr:`TRAFFIC`, identical behaviour, never removed.
     LIVE = "live"
 
 

@@ -5,22 +5,26 @@ from __future__ import annotations
 
 import gzip
 import time
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, List, Mapping, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
+from ._contour_geometry import contour_geometry
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
-from ._util import decode_json, iso_seconds_string, iso_string, ok_status
+from ._route_completeness import assert_route_has_legs
+from ._util import decode_json, iso_seconds_string, iso_string, ok_status, traffic_requested
 from ._waypoint_order import is_complete_waypoint_order
 from .base import BaseConnector
 from .config import HereConfig
-from .coordinate import assert_finite, fmt_coord, to_lat_lng_string
-from .enums import HereTransportMode, PlaceDetailsInclude, RoutingInclude, TrafficMode, TravelMode
+from .coordinate import assert_finite, assert_finite_number, fmt_coord, to_lat_lng_string
+from .defaults import HERE_MATRIX_ATTRIBUTES, HERE_ROUTING_RETURN
+from .enums import HereTransportMode, PlaceDetailsInclude, RoutingInclude, TravelMode
 from .errors import (
     ConnectorError,
     ProviderCode,
     classified_error,
     invalid_request,
     provider_error,
+    require_list,
     unknown_error,
 )
 from .geocoding import (
@@ -37,7 +41,7 @@ from .geocoding import (
     ReverseGeocodeResult,
     Viewport,
 )
-from .isochrone import IsochroneContour, IsochroneOptions, IsochroneResult, Polygon
+from .isochrone import IsochroneContour, IsochroneOptions, IsochroneResult
 from .latlng import LatLng
 from .matrix import MatrixCell, MatrixOptions, MatrixResult
 from .passthrough import Passthrough, merge_passthrough
@@ -81,14 +85,14 @@ class HereRoutingConnector(BaseConnector):
         ordered = wps
         waypoint_order = None
         if use_opt and len(wps) > 2:
-            sequence = self._find_sequence(opts)
+            sequence, sequence_status = self._find_sequence(opts)
             # The returned sequence must be a complete permutation of
             # [0..N-1] before it can reorder the waypoints; otherwise a waypoint
             # would be dropped or duplicated in the follow-up /routes request.
             # HERE is the one connector that raises rather than omitting the
             # ordering, because the sequence also drives that request.
             if not is_complete_waypoint_order(sequence, len(wps)):
-                raise ConnectorError(ProviderCode.UNKNOWN, message="HERE findsequence2 returned an invalid waypoint ordering", provider_message="HERE findsequence2 returned an invalid waypoint ordering", cause={"sequence": sequence})
+                raise ConnectorError(ProviderCode.UNKNOWN, status_code=sequence_status, message="HERE findsequence2 returned an invalid waypoint ordering", provider_message="HERE findsequence2 returned an invalid waypoint ordering", cause={"sequence": sequence})
             ordered = [wps[i] for i in sequence]
             waypoint_order = sequence
 
@@ -109,13 +113,38 @@ class HereRoutingConnector(BaseConnector):
         base_query = {
             "apiKey": self.cfg.api_key,
             "transportMode": _here_transport_mode(opts.travel_mode, opts.transport_mode),
-            "return": "polyline,summary",
+            "return": ",".join(HERE_ROUTING_RETURN),
             "routingMode": "fast",
             "origin": to_lat_lng_string(first),
             "destination": to_lat_lng_string(last),
         }
+        # HERE applies live traffic whenever departureTime is omitted (it assumes
+        # "now"), and bills such requests as Time-Aware Routing rather than basic
+        # Routing unless the request carries departureTime=any or
+        # traffic[mode]=disabled. traffic_mode NONE must therefore say so
+        # explicitly. `any` still honours long-term closures; `disabled` is the
+        # only switch that keeps a caller-supplied time, at the cost of ignoring
+        # those closures too. A time supplied through passthrough counts as well:
+        # HERE rejects `any` combined with arrivalTime (400), and a passthrough
+        # departureTime would replace `any` and silently restore Time-Aware
+        # billing. Set before the passthrough merge so a caller can still
+        # override either key.
+        traffic = traffic_requested(opts.traffic_mode)
+        pt_query = (opts.passthrough.query if opts.passthrough else None) or {}
+        # A passthrough departureTime=any is the caller asking for `any` itself,
+        # so it keeps the closure-preserving default.
+        carries_time = (
+            bool(opts.departure_time)
+            or pt_query.get("departureTime", "any") != "any"
+            or "arrivalTime" in pt_query
+        )
         if opts.departure_time:
             base_query["departureTime"] = iso_string(opts.departure_time)
+        if not traffic:
+            if carries_time:
+                base_query["traffic[mode]"] = "disabled"
+            else:
+                base_query["departureTime"] = "any"
         af = _here_avoid_features(opts)
         if af:
             base_query["avoid[features]"] = af
@@ -141,7 +170,10 @@ class HereRoutingConnector(BaseConnector):
             if notice:
                 msg = f"{msg}: {notice}"
             raise classified_error(ProviderCode.NO_ROUTE, resp.status, raw, msg)
-        route = routes[0]
+        route = routes[0] if isinstance(routes, list) else None
+        sections = jget(route, "sections")
+        if not isinstance(route, dict) or not all(isinstance(s, dict) for s in (jlist(sections) or [])):
+            raise unknown_error(resp.status, raw, "HERE Routing returned a malformed route")
 
         # HERE ships baseDuration inside the summary block already requested, so the
         # opt-in costs nothing extra here — it only gates whether the field is
@@ -149,16 +181,17 @@ class HereRoutingConnector(BaseConnector):
         wants_base = opts.includes(RoutingInclude.DURATION_WITHOUT_TRAFFIC)
 
         all_coords: List[LatLng] = []
-        legs: List[RoutingLeg] = []
+        section_legs: List[RoutingLeg] = []
         total_dist = total_dur = 0.0
-        for section in route.get("sections") or []:
+        sections = jlist(sections) or []
+        for section in sections:
             poly = jstr(section.get("polyline"))
             if poly:
                 all_coords.extend(decode_flex_polyline(poly))
-            summ = section.get("summary") or {}
-            length, duration = jnum(summ.get("length")), jnum(summ.get("duration"))
-            base = summ.get("baseDuration")
-            legs.append(
+            summ = section.get("summary")
+            length, duration = jnum(jget(summ, "length")), jnum(jget(summ, "duration"))
+            base = jget(summ, "baseDuration")
+            section_legs.append(
                 RoutingLeg(
                     length,
                     duration,
@@ -172,12 +205,15 @@ class HereRoutingConnector(BaseConnector):
             total_dist += length
             total_dur += duration
 
+        legs = _here_group_sections_into_legs(sections, section_legs, len(waypoints))
+        assert_route_has_legs(len(legs), len(waypoints), "HERE Routing", raw, resp.status)
+
         # Summed from the sections HERE returned, matching how the traffic-aware
         # totals are derived — and only when EVERY section carried the value, so a
         # partial response omits the field rather than under-reporting it.
         total_base = None
-        if wants_base and legs and all(l.duration_without_traffic_seconds is not None for l in legs):
-            total_base = sum(l.duration_without_traffic_seconds or 0.0 for l in legs)
+        if wants_base and section_legs and all(l.duration_without_traffic_seconds is not None for l in section_legs):
+            total_base = sum(l.duration_without_traffic_seconds or 0.0 for l in section_legs)
 
         return RoutingResult(
             legs=legs,
@@ -188,7 +224,7 @@ class HereRoutingConnector(BaseConnector):
             total_duration_without_traffic_seconds=total_base,
         )
 
-    def _find_sequence(self, opts: RoutingOptions) -> List[int]:
+    def _find_sequence(self, opts: RoutingOptions) -> Tuple[List[int], int]:
         wps = list(opts.waypoints)
         first, last = wps[0], wps[-1]
         intermediates = wps[1:-1]
@@ -197,36 +233,32 @@ class HereRoutingConnector(BaseConnector):
             "apiKey": self.cfg.api_key,
             "start": to_lat_lng_string(first),
             "end": to_lat_lng_string(last),
-            # Two fixes in one string, deliberately split by cost:
-            #
-            # tollroad:-3 — the toll modifier is FREE, so avoid_tolls is honoured
-            # unconditionally. Without it the optimizer ordered waypoints as if
-            # tolls were fine and only the follow-up /routes call avoided them, so
-            # the ordering and the route disagreed.
-            #
-            # traffic: — enabling traffic on findsequence2 is BILLABLE, so it
-            # follows the explicit traffic_mode opt-in and stays disabled by
-            # default.
+            # The avoid features ride in `mode` so the optimizer orders the stops
+            # under the same constraints the follow-up /routes call honours —
+            # otherwise the ordering and the route can disagree. Traffic is kept
+            # separate because enabling it on findsequence2 is BILLABLE, so it
+            # follows the explicit traffic_mode opt-in.
             "mode": _here_sequence_mode(tm, opts),
         }
         if opts.departure_time:
             # findsequence2 documents the departure-time param as `departure`
-            # (ISO 8601); `departureTime` is not recognized and was silently
-            # ignored. Seconds precision — the endpoint 400s on a fractional value.
+            # (ISO 8601); it ignores an unrecognized `departureTime` without an
+            # error. Seconds precision — the endpoint 400s on a fractional value.
             query["departure"] = iso_seconds_string(opts.departure_time)
         for i, wp in enumerate(intermediates):
             query[f"destination{i + 1}"] = to_lat_lng_string(wp)
 
-        # Merge `_passthrough` (query + headers) into this leg too — it was silently
-        # dropped, so a consumer could not tune the sequence request.
+        # `_passthrough` (query + headers) applies to this leg too, so a consumer
+        # can tune the sequence request as well as the route.
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, query)
         resp = self.send_get(_SEQUENCE_URL, m_headers, m_query)
         data = resp.body
         if not ok_status(resp.status):
             raise _here_http_error(resp.status, resp.headers, data)
         raw = decode_json(data)
-        results = raw.get("results") if isinstance(raw, dict) else None
-        if not results or not isinstance(results[0].get("waypoints"), list):
+        results = jlist(jget(raw, "results"))
+        entries = jget(results[0], "waypoints") if results else None
+        if not isinstance(entries, list) or not all(isinstance(w, dict) for w in entries):
             # The legacy WPS endpoint also reports a rejected request as HTTP 200
             # with {"results": None, "errors": [...], "responseCode": "400"}, so
             # the reason arrives here rather than through _here_http_error.
@@ -237,7 +269,7 @@ class HereRoutingConnector(BaseConnector):
                 else "HERE findsequence2 returned no sequence"
             )
             raise unknown_error(resp.status, raw, message)
-        entries = sorted(results[0]["waypoints"], key=lambda w: jnum(w.get("sequence")))
+        entries = sorted(entries, key=lambda w: jnum(w.get("sequence")))
         last_index = len(wps) - 1
         absolute: List[int] = []
         for e in entries:
@@ -253,7 +285,7 @@ class HereRoutingConnector(BaseConnector):
                     continue
                 if 1 <= n < last_index:
                     absolute.append(n)
-        return absolute
+        return absolute, resp.status
 
 
 class HereMatrixConnector(BaseConnector):
@@ -263,6 +295,8 @@ class HereMatrixConnector(BaseConnector):
         self._sleep = sleep or time.sleep
 
     def matrix(self, opts: MatrixOptions) -> MatrixResult:
+        if not opts.origins or not opts.destinations:
+            raise invalid_request("HERE Matrix requires at least one origin and one destination")
         deadline, clean_pt = extract_timeout_ms(opts.passthrough)
         matrix_id, status_url = self._submit(opts, clean_pt)
         result_url = self._poll(matrix_id, status_url, deadline)
@@ -277,15 +311,32 @@ class HereMatrixConnector(BaseConnector):
             "origins": [{"lat": o.lat, "lng": o.lng} for o in opts.origins],
             "destinations": [{"lat": d.lat, "lng": d.lng} for d in opts.destinations],
             "regionDefinition": {"type": "autoCircle"},
-            "matrixAttributes": ["travelTimes", "distances"],
+            "matrixAttributes": list(HERE_MATRIX_ATTRIBUTES),
         }
         profile = _here_transport_mode(opts.travel_mode, opts.transport_mode)
         if profile != "car":
             body["transportMode"] = profile
         if opts.avoid_tolls:
             body["avoid"] = {"features": ["tollRoad"]}
+        # Matrix v8 is a single SKU, but like /v8/routes it computes against live
+        # traffic whenever departureTime is omitted, which contradicts the
+        # traffic_mode NONE default. Same switches as routing (see
+        # HereRoutingConnector._call_routes), in body form, including the
+        # passthrough time fields (matrix also 400s on `any` + arrivalTime).
+        traffic = traffic_requested(opts.traffic_mode)
+        pt_body = (pt.body if pt else None) or {}
+        carries_time = (
+            bool(opts.departure_time)
+            or pt_body.get("departureTime", "any") != "any"
+            or "arrivalTime" in pt_body
+        )
         if opts.departure_time:
             body["departureTime"] = iso_string(opts.departure_time)
+        if not traffic:
+            if carries_time:
+                body["traffic"] = {"mode": "disabled"}
+            else:
+                body["departureTime"] = "any"
         base_query = {"apiKey": self.cfg.api_key, "async": "true"}
         m_body, m_headers, m_query = merge_passthrough(body, {}, pt, base_query)
         resp = self.send_post_json(_MATRIX_URL, m_body, m_headers, m_query)
@@ -361,31 +412,33 @@ class HereMatrixConnector(BaseConnector):
             raise unknown_error(resp.status, raw, "HERE Matrix retrieve missing matrix payload")
         no, nd = len(opts.origins), len(opts.destinations)
         stride = int(jnum(matrix.get("numDestinations"))) if jnum(matrix.get("numDestinations")) > 0 else nd
-        travel_times = matrix.get("travelTimes") or []
-        distances = matrix.get("distances") or []
+        travel_times = matrix.get("travelTimes")
+        distances = matrix.get("distances")
         # Per-cell status parallel to travelTimes/distances (0 = OK, 3 = usable
         # despite a violated constraint); any other non-zero code marks that
         # cell's value as unspecified.
-        error_codes = matrix.get("errorCodes") or []
+        error_codes = jlist(matrix.get("errorCodes")) or []
         expected = (no - 1) * stride + nd if no > 0 and nd > 0 else 0
-        if len(travel_times) < expected or len(distances) < expected:
+        if not isinstance(travel_times, list) or not isinstance(distances, list) or len(travel_times) < expected or len(distances) < expected:
             raise unknown_error(resp.status, raw, "HERE Matrix returned arrays too short for the requested dimensions")
 
         # travelTimes -> duration_seconds, distances -> distance_meters. Omit
-        # cells HERE flagged as failed (errorCode not 0/3); their value is
-        # unspecified. Contract: failed entries are omitted from cells.
+        # cells HERE flagged as failed (errorCode not 0/3) — their value is
+        # unspecified — and any entry that is not a number, rather than read it
+        # as 0. Contract: failed entries are omitted from cells.
         def _cell_ok(idx: int) -> bool:
             if idx < len(error_codes):
                 ec = error_codes[idx]
                 return ec in (0, 3)
             return True
 
-        cells = [
-            MatrixCell(oi, di, jnum(distances[oi * stride + di]), jnum(travel_times[oi * stride + di]))
-            for oi in range(no)
-            for di in range(nd)
-            if _cell_ok(oi * stride + di)
-        ]
+        cells = []
+        for oi in range(no):
+            for di in range(nd):
+                idx = oi * stride + di
+                distance, duration = jnum_opt(distances[idx]), jnum_opt(travel_times[idx])
+                if _cell_ok(idx) and distance is not None and duration is not None:
+                    cells.append(MatrixCell(oi, di, distance, duration))
         return MatrixResult(cells=cells, raw=raw)
 
 
@@ -423,7 +476,7 @@ class HereGeocodingConnector(BaseConnector):
         country_code_filter = _here_country_code_filter(opts.country_filter)
         if country_code_filter is not None:
             base_query["in"] = country_code_filter
-        raw = self._get(_GEOCODE_URL, base_query, opts.passthrough)
+        raw = self._get(_GEOCODE_URL, base_query, opts.passthrough, "HERE Geocoding")
         return GeocodeResult(candidates=_normalize_here_items(raw), raw=raw)
 
     def reverse_geocode(self, opts: ReverseGeocodeOptions) -> ReverseGeocodeResult:
@@ -431,7 +484,7 @@ class HereGeocodingConnector(BaseConnector):
         base_query = {"at": to_lat_lng_string(opts.location), "apiKey": self.cfg.api_key}
         if opts.language:
             base_query["lang"] = opts.language
-        raw = self._get(_REVGEOCODE_URL, base_query, opts.passthrough)
+        raw = self._get(_REVGEOCODE_URL, base_query, opts.passthrough, "HERE Reverse Geocoding")
         return ReverseGeocodeResult(candidates=_normalize_here_items(raw), raw=raw)
 
     def autocomplete(self, opts: AutocompleteOptions) -> AutocompleteResult:
@@ -441,6 +494,7 @@ class HereGeocodingConnector(BaseConnector):
         if opts.location is not None:
             assert_finite(opts.location, "HERE autocomplete location")
             if opts.radius is not None:
+                assert_finite_number(opts.radius, "HERE autocomplete radius")
                 base_query["in"] = f"circle:{to_lat_lng_string(opts.location)};r={fmt_coord(opts.radius)}"
             else:
                 base_query["at"] = to_lat_lng_string(opts.location)
@@ -470,7 +524,7 @@ class HereGeocodingConnector(BaseConnector):
             raise _here_http_error(resp.status, resp.headers, resp.body)
         raw = decode_json(resp.body)
         preds = []
-        for it in jlist(jget(raw, "items")) or []:
+        for it in require_list(resp.status, raw, "items", "HERE Autosuggest"):
             title = jstr(jget(it, "title"))
             # HERE's *query*-type suggestions carry a title but no address at all, so
             # `secondary_text` stays None rather than an empty string.
@@ -489,12 +543,14 @@ class HereGeocodingConnector(BaseConnector):
             )
         return AutocompleteResult(predictions=preds, raw=raw)
 
-    def _get(self, url, base_query, pt):
+    def _get(self, url, base_query, pt, label: str):
         _, m_headers, m_query = merge_passthrough({}, {}, pt, base_query)
         resp = self.send_get(url, m_headers, m_query)
         if not ok_status(resp.status):
             raise _here_http_error(resp.status, resp.headers, resp.body)
-        return decode_json(resp.body)
+        raw = decode_json(resp.body)
+        require_list(resp.status, raw, "items", label)
+        return raw
 
     def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
         """Resolve a HERE place id to a full candidate.
@@ -509,14 +565,18 @@ class HereGeocodingConnector(BaseConnector):
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         resp = self.send_get(_LOOKUP_URL, m_headers, m_query)
         raw = decode_json(resp.body)
+        if resp.status == 404:
+            # Lookup answers an id it does not know with 404; that is "no such
+            # place", not a failed request.
+            return PlaceDetailsResult(candidate=None, raw=raw)
         if not ok_status(resp.status):
             raise _here_http_error(resp.status, resp.headers, resp.body)
+        if not isinstance(raw, dict):
+            raise unknown_error(resp.status, raw, "HERE Place Details returned a malformed response body")
 
         candidates = _normalize_here_items({"items": [raw]})
         if not candidates:
-            raise classified_error(
-                ProviderCode.NO_ROUTE, resp.status, raw, "HERE Place Details returned no position"
-            )
+            return PlaceDetailsResult(candidate=None, raw=raw)
 
         # HERE's `title` IS the display name; free, but still gated so the shape
         # matches every other provider.
@@ -533,7 +593,7 @@ class HereIsochroneConnector(BaseConnector):
         self.cfg = config
 
     def isochrone(self, opts: IsochroneOptions) -> IsochroneResult:
-        from .isochrone_validate import validate_isochrone_cap
+        from .isochrone_validate import isochrone_departure, validate_isochrone_cap
 
         validate_isochrone_cap(opts.values)
         assert_finite(opts.center, "HERE isochrone center")
@@ -547,28 +607,46 @@ class HereIsochroneConnector(BaseConnector):
             "range[values]": ",".join(fmt_coord(v) for v in opts.values),
             "transportMode": transport_mode,
         }
-        if opts.departure_time:
-            base_query["departureTime"] = opts.departure_time
+        if opts.departure_time is not None:
+            base_query["departureTime"] = isochrone_departure(opts.departure_time, "HERE Isochrone")
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         resp = self.send_get(_ISOLINE_URL, m_headers, m_query)
         if not ok_status(resp.status):
             raise _here_http_error(resp.status, resp.headers, resp.body)
         raw = decode_json(resp.body)
         contours: List[IsochroneContour] = []
-        for iso in jlist(jget(raw, "isolines")) or []:
-            polys = jlist(jget(iso, "polygons")) or []
-            ring: List[List[float]] = []
-            if polys and jstr(jget(polys[0], "outer")):
-                for p in decode_flex_polyline(jstr(jget(polys[0], "outer"))):
-                    ring.append([p.lng, p.lat])
-                if ring and (ring[0][0] != ring[-1][0] or ring[0][1] != ring[-1][1]):
-                    ring.append([ring[0][0], ring[0][1]])
-            contours.append(IsochroneContour(value=jnum(jget(jget(iso, "range"), "value")), geometry=Polygon(type="Polygon", coordinates=[ring])))
+        for iso in require_list(resp.status, raw, "isolines", "HERE Isochrone"):
+            # `polygons` is a MultiPolygon: an isoline can split into several
+            # parts (islands, areas joined only by a ferry `connection`), each
+            # with its own `inner` holes. Every part is kept.
+            parts = [p for p in (_here_isoline_part(poly) for poly in jlist(jget(iso, "polygons")) or []) if p]
+            value = jnum_opt(jget(jget(iso, "range"), "value"))
+            if value is None or not parts:
+                raise unknown_error(resp.status, raw, "HERE Isochrone returned an isoline without a value or outer polygon")
+            contours.append(IsochroneContour(value=value, geometry=contour_geometry(parts)))
+        if not contours:
+            raise unknown_error(resp.status, raw, "HERE Isochrone returned no isolines")
         contours.sort(key=lambda c: c.value)
         return IsochroneResult(contours=contours, raw=raw)
 
 
 # ---- shared here helpers ----
+
+def _here_isoline_part(poly: Any) -> List[List[List[float]]]:
+    """One isoline polygon as ``[outer, *inner]`` [lng, lat] rings; empty when it
+    has no decodable outer ring."""
+    outer = jstr(jget(poly, "outer"))
+    ring = [[p.lng, p.lat] for p in decode_flex_polyline(outer)] if outer else []
+    if not ring:
+        return []
+    rings = [ring]
+    for inner in jlist(jget(poly, "inner")) or []:
+        encoded = jstr(inner)
+        hole = [[p.lng, p.lat] for p in decode_flex_polyline(encoded)] if encoded else []
+        if hole:
+            rings.append(hole)
+    return rings
+
 
 def _here_header(headers: Mapping[str, str], name: str) -> str:
     """Case-insensitive header lookup. The Transport contract lower-cases keys,
@@ -620,6 +698,49 @@ def _here_transport_mode(mode: TravelMode, override: Optional[HereTransportMode]
     if mode == TravelMode.CYCLING:
         return "bicycle"
     return "car"
+
+
+def _here_group_sections_into_legs(
+    sections: List[Any], section_legs: List[RoutingLeg], waypoint_count: int
+) -> List[RoutingLeg]:
+    """Fold HERE route sections into one leg per consecutive waypoint pair.
+
+    A HERE section is the stretch between consecutive waypoints OR an implicit mode
+    change — a ferry or car shuttle inside a driving route starts its own
+    ``TransitSection`` — so sections are not legs. The waypoint boundary is marked
+    on the place itself: ``arrival.place.waypoint`` is present when that place is
+    the ``via`` with the same index, and absent for the origin, the destination and
+    any stop the router added. A leg therefore closes after a section whose arrival
+    carries ``waypoint``, and after the final section.
+
+    Values are summed across the grouped sections; ``duration_without_traffic``
+    only when every grouped section carried it, so a partial group omits it rather
+    than under-reporting.
+
+    When no section carries the marker and there is exactly one section per
+    waypoint pair, the sections already are the legs and are kept 1:1.
+    """
+    closes = [jget(jget(jget(s, "arrival"), "place"), "waypoint") is not None for s in sections]
+    if not any(closes) and len(section_legs) == waypoint_count - 1:
+        return list(section_legs)
+
+    legs: List[RoutingLeg] = []
+    group: List[RoutingLeg] = []
+    for i, leg in enumerate(section_legs):
+        group.append(leg)
+        if closes[i] or i == len(section_legs) - 1:
+            bases = [g.duration_without_traffic_seconds for g in group]
+            legs.append(
+                RoutingLeg(
+                    sum(g.distance_meters for g in group),
+                    sum(g.duration_seconds for g in group),
+                    duration_without_traffic_seconds=(
+                        sum(b for b in bases if b is not None) if all(b is not None for b in bases) else None
+                    ),
+                )
+            )
+            group = []
+    return legs
 
 
 def _here_avoid_features(opts: RoutingOptions) -> str:
@@ -694,17 +815,25 @@ def _assert_here_api_url(raw_url: str, label: str) -> None:
 def _normalize_here_items(raw: Any) -> List[GeocodeCandidate]:
     out: List[GeocodeCandidate] = []
     for item in jlist(jget(raw, "items")) or []:
-        addr = jstr(jget(item, "title")) or jstr(jget(jget(item, "address"), "label"))
-        pos = jget(item, "position") or {}
+        # `address.label` is the full address; `title` is the result's display name,
+        # which for a POI is just its name (live: title "Empire State Building",
+        # label "Empire State Building, 20 W 34th St, New York, NY 10118, United
+        # States"). The title is only a fallback for an item without a label.
+        addr = jstr(jget(jget(item, "address"), "label")) or jstr(jget(item, "title"))
+        pos = jget(item, "position")
         # Skip an item without a real position rather than emitting a fabricated
         # (0,0) "Null Island" candidate.
-        lat, lng = jnum_opt(pos.get("lat")), jnum_opt(pos.get("lng"))
+        lat, lng = jnum_opt(jget(pos, "lat")), jnum_opt(jget(pos, "lng"))
         if lat is None or lng is None:
             continue
         viewport = None
         mv = jget(item, "mapView")
-        if isinstance(mv, dict):
-            viewport = Viewport(LatLng(jnum(mv.get("south")), jnum(mv.get("west"))), LatLng(jnum(mv.get("north")), jnum(mv.get("east"))))
+        corners = [jnum_opt(jget(mv, k)) for k in ("south", "west", "north", "east")]
+        # A partial mapView is dropped whole: a 0-filled edge would stretch the
+        # consumer's bounds to the equator or the prime meridian.
+        if all(c is not None for c in corners):
+            south, west, north, east = corners
+            viewport = Viewport(LatLng(south, west), LatLng(north, east))
         out.append(GeocodeCandidate(formatted_address=addr, location=LatLng(lat, lng), place_id=jstr(jget(item, "id")) or None, viewport=viewport))
     return out
 
@@ -750,11 +879,23 @@ _ISO_ALPHA2_TO_ALPHA3 = {
 
 
 def _here_sequence_mode(transport_mode: str, opts: RoutingOptions) -> str:
-    """Build the findsequence2 ``mode`` string (see the call site for the why)."""
-    traffic = "enabled" if opts.traffic_mode == TrafficMode.LIVE else "disabled"
+    """Build the findsequence2 ``mode`` string (see the call site for the why).
+
+    HERE's format is ``Type;TransportModes;TrafficMode;Feature:weight,...`` — the
+    road features share ONE segment, comma-delimited, and ``-3`` means "strictly
+    avoid". Ferries are two features there (``boatFerry``, ``railFerry``) where
+    /routes has one ``ferry``, so both are avoided."""
+    traffic = "enabled" if traffic_requested(opts.traffic_mode) else "disabled"
     mode = f"fastest;{transport_mode};traffic:{traffic}"
+    features = []
     if opts.avoid_tolls:
-        mode += ";tollroad:-3"
+        features.append("tollroad:-3")
+    if opts.avoid_highways:
+        features.append("motorway:-3")
+    if opts.avoid_ferries:
+        features += ["boatFerry:-3", "railFerry:-3"]
+    if features:
+        mode += ";" + ",".join(features)
     return mode
 
 

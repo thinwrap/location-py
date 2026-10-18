@@ -48,6 +48,18 @@ Provision a project at https://platform.here.com/ and create a REST API key. Sen
 
 `optimize=True` triggers the two-step `findsequence2` → `routes` flow. Travel mode maps to HERE `transportMode`. Intermediate waypoints are added as `via=lat,lng` query parameters.
 
+The avoid flags reach **both** legs, so the stops are ordered under the same constraints the
+route honours. `findsequence2` takes them as road features in one comma-delimited segment of its
+`mode` string, `-3` meaning "strictly avoid": `avoid_tolls` ⇒ `tollroad:-3`, `avoid_highways` ⇒
+`motorway:-3`, `avoid_ferries` ⇒ `boatFerry:-3,railFerry:-3` — e.g.
+`mode=fastest;car;traffic:disabled;tollroad:-3,motorway:-3`.
+
+`legs` has one entry per consecutive waypoint pair. HERE `sections` are not legs: a section
+also ends at an implicit mode change, so a ferry or car shuttle inside a driving route becomes
+its own transit section. The connector closes a leg after each section whose
+`arrival.place.waypoint` is set (a `via` from the request) and after the final section,
+summing the grouped sections' distance and duration.
+
 `transport_mode` (a `HereTransportMode`) overrides the base `travel_mode` mapping with HERE's own
 vehicle classes:
 
@@ -90,6 +102,34 @@ routing.route(RoutingOptions(
 > ignores query parameters it does not recognize (verified live), so a `/v8/routes`-only key
 > such as `taxi[...]` rides along harmlessly rather than failing the sequence call.
 
+### Traffic and billing
+
+Traffic is **off unless you pass `traffic_mode=TrafficMode.TRAFFIC`** (or the deprecated alias `LIVE`). HERE's own default is the
+opposite: a request without `departureTime` is computed for the current time, against live
+traffic. That also decides the price — HERE bills `/v8/routes` as **Time-Aware Routing**
+(fewer free requests and a higher per-1k rate, see [HERE pricing](https://www.here.com/get-started/pricing))
+rather than basic **Routing** unless the request carries `departureTime=any` or `traffic[mode]=disabled`.
+
+| `traffic_mode` | `departure_time` | Sent on `/v8/routes` |
+|---|---|---|
+| `NONE` (default) | not set | `departureTime=any` |
+| `NONE` (default) | set | `departureTime=<ISO>&traffic[mode]=disabled` |
+| `TRAFFIC` | not set | nothing — HERE applies live traffic |
+| `TRAFFIC` | set | `departureTime=<ISO>` |
+
+`departureTime=any` ignores dynamic traffic but still applies long-term closures.
+`traffic[mode]=disabled` is the only way to keep your departure time without traffic, and it
+ignores **all** traffic data, long-term closures included — so a `departure_time` with
+`NONE` can route through a road HERE knows is closed. Pass `TRAFFIC` if closures matter more to
+you than the Time-Aware rate. An `arrivalTime`, or a `departureTime` other than `any`, supplied
+through passthrough (`query` on routing, `body` on matrix) counts as a set time and switches the `NONE` default to
+`traffic[mode]=disabled`, since HERE rejects `departureTime=any` combined with `arrivalTime`.
+
+The same rule covers the `/v8/routes` call in the optimized flow; `findsequence2` carries
+traffic in its own `mode` string (`traffic:disabled` unless `TRAFFIC`). Both keys are set before
+the passthrough merge, so `passthrough.query` can still override them, e.g.
+`Passthrough(query={"traffic[mode]": "default"})`.
+
 ### Error mapping
 
 | Vendor HTTP | Vendor signal | `ProviderCode` |
@@ -110,18 +150,20 @@ Off by default and **not normalized** — `RoutingResult` has no `steps` attribu
 `actions,instructions` and read them from `res.raw`:
 
 ```python
+from thinwrap.location import HERE_ROUTING_RETURN, Passthrough, RoutingOptions
+
 res = routing.route(RoutingOptions(
     waypoints=[origin, destination],
-    passthrough=Passthrough(query={"return": "polyline,summary,actions,instructions"}),
+    passthrough=Passthrough(query={
+        "return": ",".join(HERE_ROUTING_RETURN + ("actions", "instructions")),
+    }),
 ))
 ```
 
 Actions land at `routes[].sections[].actions[]`: `action` (the maneuver), `instruction` (localized
 text), `offset` (an index into that section's polyline), plus `duration` and `length`.
-
-> **`return` is replaced, not merged.** The connector sends `polyline,summary`; keep both in your
-> list or legs, totals and `polyline` all come back empty with nothing raised. HERE also rejects
-> `instructions` unless `actions` is requested alongside it.
+HERE rejects `instructions` unless `actions` is requested alongside it. The `return` you pass
+replaces the connector's own — see [Replacing a default list](#replacing-a-default-list).
 
 For a full navigation payload HERE offers `turnByTurnActions`, which requires `polyline` in the
 same `return` list.
@@ -139,7 +181,15 @@ same `return` list.
 `transport_mode` (a `HereTransportMode`) overrides the base `travel_mode` mapping. Matrix v8
 publishes the same eight values as Routing v8 — `CAR`, `TRUCK`, `PEDESTRIAN`, `BICYCLE`,
 `SCOOTER`, `TAXI`, `BUS`, `PRIVATE_BUS` — with no `findsequence2` caveat, since matrix is a
-single call. Polling parameters surfaced via `passthrough.body["timeoutMs"]`.
+single call. The poll deadline defaults to 60 s; override it with
+`passthrough.body["timeoutMs"]`, a finite number of milliseconds greater than 0 — anything else
+(a numeric string, NaN, zero, a negative) raises `invalid_request` before any request is sent.
+
+`traffic_mode` follows the [routing rule](#traffic-and-billing) in body form: `NONE` sends
+`"departureTime": "any"`, or your ISO time plus `"traffic": {"mode": "disabled"}` (with the
+same closure caveat); `TRAFFIC` sends neither. Matrix v8 is one SKU with no traffic surcharge,
+but its durations include live traffic by default, so this keeps them consistent with
+`NONE`. Override via `passthrough.body` (e.g. `{"traffic": {"mode": "default"}}`).
 
 ---
 
@@ -150,6 +200,17 @@ single call. Polling parameters surfaced via `passthrough.body["timeoutMs"]`.
 - Forward: `GET https://geocode.search.hereapi.com/v1/geocode`
 - Reverse: `GET https://revgeocode.search.hereapi.com/v1/revgeocode`
 - Autocomplete: `GET https://autosuggest.search.hereapi.com/v1/autosuggest`
+
+### `formatted_address` is `address.label`
+
+Geocode, reverse geocode and place details take `formatted_address` from `address.label`,
+the full address. HERE's `title` is the result's display name — for a POI just its name
+(`"Empire State Building"` vs. `"Empire State Building, 20 W 34th St, New York, NY 10118,
+United States"`) — so it is used only when an item has no label, and on place details it is
+what `name` returns.
+
+Place details answers an id Lookup does not know (HTTP 404) or an item without a `position`
+with `candidate=None`, not an error.
 
 ### Autosuggest requires a search context
 
@@ -216,3 +277,53 @@ anchors to its own `mainText`/`secondaryText` and names them `startOffset`/`endO
 ### Input
 
 Standard `IsochroneOptions`. `type` (`IsochroneType.TIME` / `IsochroneType.DISTANCE`) maps to HERE `range[type]=time|distance`.
+
+`departure_time` ⇒ `departureTime=`. It must be an ISO-8601 date-time string (sent verbatim) or a
+`datetime` (sent as UTC). A string that is not an ISO-8601 date-time raises `invalid_request`
+before any request is sent; any other type is a `TypeError` when the options are constructed.
+Isochrones have no `traffic_mode`, so a `departure_time` makes the contour traffic-aware for
+that time, as HERE documents that a concrete departure time "take[s] traffic flow and other
+time-dependent effects into account". HERE's isoline docs do not say what an omitted time means
+(on Routing v8 it is the request time, with live traffic). Pass
+`Passthrough(query={"departureTime": "any"})` for an isoline without traffic flow.
+
+### Output
+
+HERE types an isoline's `polygons` as a MultiPolygon: disconnected parts (e.g. linked only by a
+ferry `connection`) come back as separate entries, each with an `outer` ring and optional `inner`
+holes. One entry gives a `Polygon`, several give a `MultiPolygon`; holes are kept, and rings are
+closed and wound per RFC 7946 (exterior counter-clockwise, holes clockwise).
+
+---
+
+## Replacing a default list
+
+Passthrough **replaces** a list-valued parameter the connector sets; it does not merge with it.
+That is deliberate — a merge would leave you no way to remove a value. To add one, start from
+the published default, the same tuple the connector builds its request from:
+
+| Operation | Parameter | Constant |
+|---|---|---|
+| Routing | `return` query (comma-joined) | `HERE_ROUTING_RETURN` = `("polyline", "summary")` |
+| Matrix | `matrixAttributes` body (JSON array) | `HERE_MATRIX_ATTRIBUTES` = `("travelTimes", "distances")` |
+
+```python
+from thinwrap.location import HERE_ROUTING_RETURN, Passthrough, RoutingOptions
+
+routing.route(RoutingOptions(
+    waypoints=[origin, destination],
+    passthrough=Passthrough(query={"return": ",".join(HERE_ROUTING_RETURN + ("turnByTurnActions",))}),
+))
+```
+
+`matrixAttributes` goes through `passthrough.body`; the body is deep-merged, but a list is a leaf,
+so your list replaces the connector's (`Passthrough(body={"matrixAttributes": [...]})`).
+
+> **Omitting a value the normalizer reads.**
+>
+> - Routing, silently: drop `summary` and every leg's distance and duration and the totals come
+>   back `0`, with `duration_without_traffic_seconds` `None`; drop `polyline` and `polyline` comes
+>   back `""`. Nothing raises.
+> - Matrix, loudly: `travelTimes` fills `duration_seconds` and `distances` fills
+>   `distance_meters`. Drop either and the call raises `unknown`, because the result no longer
+>   has the requested dimensions.

@@ -5,24 +5,31 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-import json
 import re
 from typing import Any, List, Optional
 
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
-from ._util import decode_json, iso_string, ok_status
+from ._route_completeness import assert_route_has_legs
+from ._util import decode_json, iso_string, ok_status, traffic_requested
 from ._waypoint_order import is_complete_waypoint_order
 from .base import BaseConnector
 from .config import GoogleConfig
-from .coordinate import assert_finite
+from .coordinate import assert_finite, assert_finite_number
+from .defaults import (
+    GOOGLE_MATRIX_FIELD_MASK,
+    GOOGLE_PLACE_DETAILS_FIELD_MASK,
+    GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME,
+    GOOGLE_ROUTES_FIELD_MASK,
+    GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC,
+    GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER,
+)
 from .enums import (
     PlaceDetailsInclude,
     PolylineQuality,
     RoutingInclude,
-    TrafficMode,
     TravelMode,
 )
-from .errors import ConnectorError, ProviderCode, classified_error, provider_error, unknown_error
+from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, require_list, unknown_error
 from .geocoding import (
     AutocompleteOptions,
     AutocompletePrediction,
@@ -88,13 +95,17 @@ class GoogleRoutingConnector(BaseConnector):
             # deriving it from a departure time would silently move a caller onto
             # Pro pricing for asking about a future trip.
             body["routingPreference"] = (
-                "TRAFFIC_AWARE" if opts.traffic_mode == TrafficMode.LIVE else "TRAFFIC_UNAWARE"
+                "TRAFFIC_AWARE" if traffic_requested(opts.traffic_mode) else "TRAFFIC_UNAWARE"
             )
         if intermediates:
             body["intermediates"] = intermediates
         if reorder and intermediates:
             body["optimizeWaypointOrder"] = True
-        if opts.departure_time:
+        # Google rejects a timestamp on TRAFFIC_UNAWARE requests (HTTP 400
+        # "Timestamp cannot be set for TRAFFIC_UNAWARE routing mode."), and an
+        # UNAWARE duration is time-independent anyway, so the time only rides
+        # along when traffic was asked for.
+        if opts.departure_time and traffic_requested(opts.traffic_mode):
             body["departureTime"] = iso_string(opts.departure_time)
         if opts.avoid_tolls or opts.avoid_ferries or opts.avoid_highways:
             body["routeModifiers"] = {
@@ -107,15 +118,11 @@ class GoogleRoutingConnector(BaseConnector):
         # built from what the caller actually asked for.
         wants_static = opts.includes(RoutingInclude.DURATION_WITHOUT_TRAFFIC)
 
-        field_mask = [
-            "routes.legs.distanceMeters", "routes.legs.duration",
-            "routes.distanceMeters", "routes.duration",
-            "routes.polyline.encodedPolyline",
-        ]
+        field_mask = list(GOOGLE_ROUTES_FIELD_MASK)
         if wants_static:
-            field_mask += ["routes.legs.staticDuration", "routes.staticDuration"]
+            field_mask += GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC
         if reorder:
-            field_mask.append("routes.optimizedIntermediateWaypointIndex")
+            field_mask += GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER
         headers = {"X-Goog-Api-Key": self.cfg.api_key, "X-Goog-FieldMask": ",".join(field_mask)}
 
         m_body, m_headers, m_query = merge_passthrough(body, headers, opts.passthrough, None)
@@ -130,10 +137,13 @@ class GoogleRoutingConnector(BaseConnector):
             raise classified_error(
                 ProviderCode.NO_ROUTE, resp.status, raw, "Google Routing returned no routes"
             )
-        route = routes[0]
+        route = routes[0] if isinstance(routes, list) else None
+        raw_legs = jget(route, "legs")
+        if not isinstance(route, dict) or not all(isinstance(l, dict) for l in (jlist(raw_legs) or [])):
+            raise unknown_error(resp.status, raw, "Google Routing returned a malformed route")
 
         legs = []
-        for l in route.get("legs") or []:
+        for l in jlist(raw_legs) or []:
             # Only when asked for AND actually returned — never synthesized from
             # `duration`, so absence stays meaningful.
             static = l.get("staticDuration")
@@ -148,6 +158,7 @@ class GoogleRoutingConnector(BaseConnector):
                     ),
                 )
             )
+        assert_route_has_legs(len(legs), len(wps), "Google Routing", raw, resp.status)
         # Canonical waypoint_order = full visiting sequence of INPUT indices.
         # Google does not always return real indices: when it declines to
         # optimize it answers [-1], which projects to [0, 0, N-1] — a corrupt
@@ -186,6 +197,8 @@ class GoogleMatrixConnector(BaseConnector):
         self.cfg = config
 
     def matrix(self, opts: MatrixOptions) -> MatrixResult:
+        if not opts.origins or not opts.destinations:
+            raise invalid_request("Google Matrix requires at least one origin and one destination")
         origins = [{"waypoint": _google_latlng(o)} for o in opts.origins]
         destinations = [{"waypoint": _google_latlng(d)} for d in opts.destinations]
         travel_mode = _google_travel_mode(opts.travel_mode)
@@ -201,13 +214,14 @@ class GoogleMatrixConnector(BaseConnector):
             # ELEMENT — so deriving it from `departure_time` moved
             # origins x destinations billed elements onto Pro pricing at once.
             body["routingPreference"] = (
-                "TRAFFIC_AWARE" if opts.traffic_mode == TrafficMode.LIVE else "TRAFFIC_UNAWARE"
+                "TRAFFIC_AWARE" if traffic_requested(opts.traffic_mode) else "TRAFFIC_UNAWARE"
             )
         if opts.avoid_tolls:
             body["routeModifiers"] = {"avoidTolls": True}
-        if opts.departure_time:
+        # Same TRAFFIC_UNAWARE timestamp rejection as Compute Routes.
+        if opts.departure_time and traffic_requested(opts.traffic_mode):
             body["departureTime"] = iso_string(opts.departure_time)
-        headers = {"X-Goog-Api-Key": self.cfg.api_key, "X-Goog-FieldMask": "originIndex,destinationIndex,distanceMeters,duration,status,condition"}
+        headers = {"X-Goog-Api-Key": self.cfg.api_key, "X-Goog-FieldMask": ",".join(GOOGLE_MATRIX_FIELD_MASK)}
 
         m_body, m_headers, m_query = merge_passthrough(body, headers, opts.passthrough, None)
         resp = self.send_post_json(_MATRIX_URL, m_body, m_headers, m_query)
@@ -215,7 +229,11 @@ class GoogleMatrixConnector(BaseConnector):
             raw = decode_json(resp.body)
             raise provider_error(resp.status, resp.headers, raw, _google_map_vendor_error(resp.status, raw), _google_error_message(raw))
 
-        elements = _parse_google_ndjson(resp.body.decode("utf-8"))
+        elements = _parse_google_ndjson(resp.status, resp.body.decode("utf-8", "replace"))
+        if not elements:
+            # Google streams one element per origin×destination pair, so a 2xx with
+            # none is a truncated or empty response — not a matrix with no routes.
+            raise unknown_error(resp.status, resp.body.decode("utf-8", "replace"), "Google Matrix returned no elements")
         cells: List[MatrixCell] = []
         for el in elements:
             if not isinstance(el, dict) or not _google_cell_successful(el):
@@ -262,9 +280,18 @@ class GoogleGeocodingConnector(BaseConnector):
         for code in opts.country_filter or []:
             if not _ISO_ALPHA2.match(code):
                 raise ConnectorError(ProviderCode.INVALID_REQUEST, message=f"Invalid countryFilter entry: {code} (expected ISO 3166-1 alpha-2)", provider_message=f"Invalid countryFilter entry: {code} (expected ISO 3166-1 alpha-2)")
+        if opts.country_filter and len(opts.country_filter) > 1:
+            # `components=country:A|country:B` is not an OR: Google applies the first
+            # country only and pads the results with unrelated matches (live:
+            # "Windsor" with US|CA → Windsor, CT only; CA|US → Windsor, ON only).
+            msg = (
+                "Google geocoding honours a single countryFilter entry only "
+                f"(received {len(opts.country_filter)}); multiple country components are not OR-ed"
+            )
+            raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message=msg, provider_message=msg)
         query = {"address": opts.address, "key": self.cfg.api_key}
         if opts.country_filter:
-            query["components"] = "|".join(f"country:{c}" for c in opts.country_filter)
+            query["components"] = f"country:{opts.country_filter[0]}"
         if opts.language:
             query["language"] = opts.language
 
@@ -311,6 +338,7 @@ class GoogleGeocodingConnector(BaseConnector):
             assert_finite(opts.location, "Google autocomplete")
             circle: dict[str, Any] = {"center": {"latitude": opts.location.lat, "longitude": opts.location.lng}}
             if opts.radius is not None:
+                assert_finite_number(opts.radius, "Google autocomplete radius")
                 circle["radius"] = opts.radius
             body["locationBias"] = {"circle": circle}
         headers = {"X-Goog-Api-Key": self.cfg.api_key}
@@ -318,11 +346,16 @@ class GoogleGeocodingConnector(BaseConnector):
         resp = self.send_post_json(_PLACES_AUTOCOMPLETE_URL, m_body, m_headers, m_query)
         raw = decode_json(resp.body)
         if not ok_status(resp.status):
-            err_obj = jget(raw, "error")
-            code = _google_geo_map_vendor_error(resp.status, jstr(jget(err_obj, "status")))
-            raise provider_error(resp.status, resp.headers, raw, code, jstr(jget(err_obj, "message")))
+            # Places (New) speaks the google.rpc error shape, like Routes: a bad key
+            # is HTTP 400 INVALID_ARGUMENT whose ErrorInfo reason is API_KEY_INVALID,
+            # so the reason — not the status — decides auth_failed.
+            raise provider_error(
+                resp.status, resp.headers, raw, _google_map_vendor_error(resp.status, raw), _google_error_message(raw)
+            )
         preds: List[AutocompletePrediction] = []
-        for s in jlist(jget(raw, "suggestions")) or []:
+        # Places (New) speaks proto3 JSON, which omits an empty repeated field: no
+        # predictions arrive as `{}`, not `{"suggestions": []}`.
+        for s in require_list(resp.status, raw, "suggestions", "Google Autocomplete", missing_ok=True):
             pred = jget(s, "placePrediction")
             if pred is None:
                 continue
@@ -345,7 +378,7 @@ class GoogleGeocodingConnector(BaseConnector):
         return AutocompleteResult(predictions=preds, raw=raw)
 
     def _geo_http_error(self, status, headers, raw) -> ConnectorError:
-        code = _google_geo_map_vendor_error(status, jstr(jget(raw, "status")))
+        code = _google_geo_map_vendor_error(status, jstr(jget(raw, "status")), raw)
         return provider_error(status, headers, raw, code, jstr(jget(raw, "error_message")))
 
     def _enforce_status(self, status, raw) -> None:
@@ -353,7 +386,7 @@ class GoogleGeocodingConnector(BaseConnector):
         if s in ("OK", "ZERO_RESULTS"):
             return
         pm = jstr(jget(raw, "error_message")) or s
-        raise classified_error(_google_geo_map_vendor_error(status, s), status, raw, pm)
+        raise classified_error(_google_geo_map_vendor_error(status, s, raw), status, raw, pm)
 
     def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
         """Resolve a Google ``placeId`` to a full candidate.
@@ -367,9 +400,9 @@ class GoogleGeocodingConnector(BaseConnector):
         """
         wants_name = opts.includes(PlaceDetailsInclude.NAME)
 
-        field_mask = ["id", "formattedAddress", "location", "viewport"]
+        field_mask = list(GOOGLE_PLACE_DETAILS_FIELD_MASK)
         if wants_name:
-            field_mask.append("displayName")
+            field_mask += GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME
 
         headers = {"X-Goog-Api-Key": self.cfg.api_key, "X-Goog-FieldMask": ",".join(field_mask)}
         base_query = {}
@@ -385,6 +418,11 @@ class GoogleGeocodingConnector(BaseConnector):
         url = f"{_PLACE_DETAILS_URL}/{quote(opts.place_id, safe='')}"
         resp = self.send_get(url, m_headers, m_query)
         raw = decode_json(resp.body)
+        if resp.status == 404:
+            # NOT_FOUND is "no such place". Note Places v1 answers most unknown ids
+            # (live-verified) with 400 INVALID_ARGUMENT, indistinguishable from a
+            # malformed one, so those stay an invalid_request error below.
+            return PlaceDetailsResult(candidate=None, raw=raw)
         if not ok_status(resp.status):
             raise provider_error(
                 resp.status,
@@ -393,14 +431,14 @@ class GoogleGeocodingConnector(BaseConnector):
                 _google_map_vendor_error(resp.status, raw),
                 _google_error_message(raw),
             )
+        if not isinstance(raw, dict):
+            raise unknown_error(resp.status, raw, "Google Place Details returned a malformed response body")
 
         loc = jget(raw, "location")
         lat, lng = jnum_opt(jget(loc, "latitude")), jnum_opt(jget(loc, "longitude"))
         if lat is None or lng is None:
             # Same rule as the geocode candidates: never fabricate a (0,0) location.
-            raise classified_error(
-                ProviderCode.NO_ROUTE, resp.status, raw, "Google Place Details returned no location"
-            )
+            return PlaceDetailsResult(candidate=None, raw=raw)
 
         viewport = None
         vp = jget(raw, "viewport")
@@ -504,13 +542,25 @@ def _google_map_vendor_error(status: int, body: Any) -> ProviderCode:
     return ProviderCode.UNKNOWN
 
 
-def _google_geo_map_vendor_error(status: int, google_status: str) -> ProviderCode:
-    if google_status == "REQUEST_DENIED":
+def _google_geo_map_vendor_error(status: int, google_status: str, body: Any = None) -> ProviderCode:
+    # The legacy Geocoding API reports `status` strings; should it answer in the
+    # google.rpc shape instead, its ErrorInfo reason is honoured the same way.
+    code = _google_reason_code(_google_error_reason(body))
+    if code is not None:
+        return code
+    # OVER_DAILY_LIMIT is an account problem, not a burst: Google lists a missing
+    # or invalid key, billing not enabled, a self-imposed usage cap, and an invalid
+    # payment method. Retrying does not help; fixing the account does.
+    if google_status in ("REQUEST_DENIED", "OVER_DAILY_LIMIT"):
         return ProviderCode.AUTH_FAILED
     if google_status == "OVER_QUERY_LIMIT":
         return ProviderCode.RATE_LIMITED
     if google_status == "INVALID_REQUEST":
         return ProviderCode.INVALID_REQUEST
+    # Google: "the request could not be processed due to a server error. The
+    # request may succeed if you try again."
+    if google_status == "UNKNOWN_ERROR":
+        return ProviderCode.PROVIDER_UNAVAILABLE
     if status in (401, 403):
         return ProviderCode.AUTH_FAILED
     if status == 429:
@@ -528,7 +578,7 @@ def _normalize_google_candidates(raw: Any) -> List[GeocodeCandidate]:
         geom = jget(r, "geometry")
         loc = jget(geom, "location")
         # Skip a row without real coordinates rather than emitting a fabricated
-        # (0,0) "Null Island" candidate. Mirrors the location-php sibling.
+        # (0,0) "Null Island" candidate a consumer cannot tell from a real one.
         lat, lng = jnum_opt(jget(loc, "lat")), jnum_opt(jget(loc, "lng"))
         if lat is None or lng is None:
             continue
@@ -560,31 +610,35 @@ def _normalize_google_candidates(raw: Any) -> List[GeocodeCandidate]:
     return out
 
 
-def _parse_google_ndjson(text: str) -> List[Any]:
+def _parse_google_ndjson(status: int, text: str) -> List[Any]:
     trimmed = text.strip()
     if trimmed == "":
         return []
     if trimmed.startswith("["):
-        try:
-            arr = json.loads(trimmed)
-            if isinstance(arr, list):
-                return arr
-        except ValueError:
-            pass
+        arr = decode_json(trimmed.encode("utf-8"))
+        if isinstance(arr, list):
+            return arr
     out: List[Any] = []
     for raw_line in trimmed.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
-        try:
-            out.append(json.loads(line))
-        except ValueError as exc:
-            raise unknown_error(None, exc, "Google Matrix returned an unparseable NDJSON line") from exc
+        element = decode_json(line.encode("utf-8"))
+        if element is None:
+            raise unknown_error(status, line, "Google Matrix returned an unparseable NDJSON line")
+        out.append(element)
     return out
 
 
 def _google_cell_successful(m: dict) -> bool:
     status = m.get("status")
+    condition = m.get("condition")
+    # Both are in the field mask, and a routable element carries at least
+    # `condition: ROUTE_EXISTS`. An element with neither says nothing about
+    # reachability, and reading its absent distance/duration would fabricate a
+    # 0 m / 0 s cell.
+    if status is None and condition is None:
+        return False
     if isinstance(status, dict):
         code = status.get("code")
         if code is not None and jnum(code) != 0:
@@ -592,7 +646,6 @@ def _google_cell_successful(m: dict) -> bool:
     # `condition` is independent of `status`: an element can be status-OK with
     # "ROUTE_NOT_FOUND" and no distanceMeters/duration. Treat anything other
     # than ROUTE_EXISTS (when present) as a failed cell.
-    condition = m.get("condition")
     if condition is not None and condition != "ROUTE_EXISTS":
         return False
     return True

@@ -47,6 +47,12 @@ Generate a key at https://console.cloud.google.com/google/maps-apis/credentials 
 
 The standard `RoutingOptions` shape applies as-is: `waypoints`, `travel_mode`, `optimize`, `departure_time`, `avoid_tolls`, `avoid_ferries`, `avoid_highways`. Provider-specific Routes v2 features (lane guidance, route modifiers) go via `passthrough.body`.
 
+`traffic_mode` sets `routingPreference` for DRIVE and TWO_WHEELER (Google rejects it for WALK
+and BICYCLE): `NONE` ⇒ `TRAFFIC_UNAWARE` (time-independent average speeds, Essentials SKU),
+`TRAFFIC`/`LIVE` ⇒ `TRAFFIC_AWARE` (**Pro SKU**). `departure_time` is sent only with traffic:
+Google rejects a timestamp on `TRAFFIC_UNAWARE` ("Timestamp cannot be set for
+TRAFFIC_UNAWARE routing mode.", HTTP 400), so under `NONE` it is dropped.
+
 ### `waypoint_order` and Google's `[-1]` answer
 
 Google reports the optimized order as `routes.optimizedIntermediateWaypointIndex`, over the
@@ -79,18 +85,14 @@ On HTTP 429, the raw `Retry-After` header rides in `ConnectorError.cause["retryA
 ### `passthrough` example
 
 ```python
-from thinwrap.location import RoutingOptions, Passthrough
+from thinwrap.location import GOOGLE_ROUTES_FIELD_MASK, Passthrough, RoutingOptions
 
 res = routing.route(RoutingOptions(
     waypoints=[origin, destination],
     passthrough=Passthrough(
         body={"languageCode": "fr", "units": "IMPERIAL"},
-        # The mask REPLACES the connector's own — re-list the fields it needs, then add yours.
-        headers={
-            "X-Goog-FieldMask": "routes.legs.distanceMeters,routes.legs.duration,"
-            "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
-            "routes.warnings"
-        },
+        # The mask REPLACES the connector's own, so start from the published default.
+        headers={"X-Goog-FieldMask": ",".join(GOOGLE_ROUTES_FIELD_MASK + ("routes.warnings",))},
     ),
 ))
 ```
@@ -104,21 +106,16 @@ fields to the mask and read them from `res.raw`, which carries Google's response
 res = routing.route(RoutingOptions(
     waypoints=[origin, destination],
     passthrough=Passthrough(headers={
-        "X-Goog-FieldMask": "routes.legs.distanceMeters,routes.legs.duration,"
-        "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
-        "routes.legs.steps.navigationInstruction"
+        "X-Goog-FieldMask": ",".join(
+            GOOGLE_ROUTES_FIELD_MASK + ("routes.legs.steps.navigationInstruction",)
+        ),
     }),
 ))
 ```
 
 Instruction text is at `routes[].legs[].steps[].navigationInstruction.instructions`; the icon
-enum is at `.maneuver`.
-
-> **The mask is replaced, not merged.** `Passthrough(headers=...)` overrides `X-Goog-FieldMask`
-> wholesale, so the five baseline fields above have to stay. Drop
-> `routes.polyline.encodedPolyline` and `polyline` comes back `""`; drop a distance or duration
-> and the matching normalized field comes back `0`. Nothing raises — absent values are coalesced,
-> so the failure looks like a real zero-length route.
+enum is at `.maneuver`. The mask you pass replaces the connector's own — see
+[Replacing a default list](#replacing-a-default-list) for why and what to keep.
 
 Requesting steps does not change the SKU: the Compute Routes SKU is selected by request
 *features* (`TRAFFIC_AWARE`, two-wheel routing), not by requested fields. It does enlarge the
@@ -134,7 +131,7 @@ response considerably.
 
 ### Input
 
-Standard `MatrixOptions` (`origins`, `destinations`, `travel_mode`, `departure_time`). The connector flattens the response into a list of `MatrixCell` with `origin_index` + `destination_index`.
+Standard `MatrixOptions` (`origins`, `destinations`, `travel_mode`, `departure_time`). `traffic_mode` and `departure_time` follow the [routing rule](#input); Route Matrix bills per element, so `TRAFFIC` moves every element onto the Pro SKU. The connector flattens the response into a list of `MatrixCell` with `origin_index` + `destination_index`.
 
 ### Error mapping
 
@@ -173,9 +170,15 @@ Google returns HTTP 200 with a `status` field on geocoding errors. The connector
 |---|---|
 | `OK` / `ZERO_RESULTS` | (no error) |
 | `REQUEST_DENIED` | `auth_failed` |
+| `OVER_DAILY_LIMIT` | `auth_failed` (invalid key, billing not enabled, a self-imposed usage cap, or an invalid payment method — an account fix, not a retry) |
 | `OVER_QUERY_LIMIT` | `rate_limited` |
 | `INVALID_REQUEST` | `invalid_request` |
 | `UNKNOWN_ERROR` | `provider_unavailable` |
+
+Autocomplete (Places API New) answers in the `google.rpc` error shape instead, and uses the
+routing table above: an invalid key is HTTP 400 `INVALID_ARGUMENT` whose `ErrorInfo.reason`
+is `API_KEY_INVALID`, surfaced as `auth_failed` — as are the other key/credential reasons
+(`API_KEY_SERVICE_BLOCKED`, `API_KEY_HTTP_REFERRER_BLOCKED`, …).
 
 ### `passthrough` example
 
@@ -195,7 +198,7 @@ translates it into the parameter that operation's endpoint actually takes:
 
 | Operation | Parameter |
 |---|---|
-| `geocode()` | `components=country:XX\|country:YY` |
+| `geocode()` | `components=country:XX` — **one country only** |
 | `autocomplete()` | `includedRegionCodes` (JSON body) |
 
 ```python
@@ -210,6 +213,11 @@ Two things the translation handles for you, because both fail quietly otherwise:
   predictions rather than an error, so the connector rewrites it.
 - **Google caps the list at 15** and rejects the whole request over that. The connector
   raises `invalid_request` before the round-trip.
+- **`geocode()` honours a single country.** `components=country:US|country:CA` is not an
+  OR: Google applies the first country and pads the results with unrelated matches ("Windsor"
+  with `US|CA` → only Windsor, CT; `CA|US` → only Windsor, ON). More than one entry raises
+  `unsupported_option` before any request; autocomplete's `includedRegionCodes` does take a
+  list.
 
 > **Setting a country filter also suppresses Google's *query* predictions.** It changes
 > which *kinds* of suggestion come back, not only how many — a query-type row (a search
@@ -234,3 +242,54 @@ present by default — no extra request field and no extra cost.
 > `text[start:end]` is correct here — Python is the one language in this family where the
 > obvious slice needs no conversion (JavaScript is UTF-16, PHP `substr` and Go slicing are
 > byte-based).
+
+---
+
+## Replacing a default list
+
+Every Google endpoint here requires an `X-Goog-FieldMask`, and the connector sends its own.
+`Passthrough(headers={"X-Goog-FieldMask": ...})` **replaces** that mask; it does not merge
+with it. That is deliberate — a merge would leave you no way to remove a field. To add one,
+start from the published default, which is the same tuple the connector builds its request
+from:
+
+```python
+from thinwrap.location import GOOGLE_ROUTES_FIELD_MASK, Passthrough, RoutingOptions
+
+routing.route(RoutingOptions(
+    waypoints=[origin, destination],
+    passthrough=Passthrough(headers={
+        "X-Goog-FieldMask": ",".join(GOOGLE_ROUTES_FIELD_MASK + ("routes.travelAdvisory",)),
+    }),
+))
+```
+
+| Operation | Always sent | Added by the connector when… |
+|---|---|---|
+| Routing | `GOOGLE_ROUTES_FIELD_MASK` | `GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC` — `include` has `DURATION_WITHOUT_TRAFFIC`; `GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER` — any `optimize*` flag or `is_round_trip` |
+| Matrix | `GOOGLE_MATRIX_FIELD_MASK` | — |
+| Place details | `GOOGLE_PLACE_DETAILS_FIELD_MASK` | `GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME` — `include` has `PlaceDetailsInclude.NAME` |
+
+Your mask replaces the conditional groups too, so re-add any group your request would have
+triggered.
+
+> **Omitting a field the normalizer reads empties that output — mostly without raising.**
+> Absent values are coalesced, so the result looks like a real zero-length route.
+>
+> - Routing: `routes.legs.distanceMeters` / `routes.legs.duration` → each leg's distance /
+>   duration (`0`); `routes.distanceMeters` / `routes.duration` → the totals (`0`);
+>   `routes.polyline.encodedPolyline` → `polyline` (`""`); the static-duration fields →
+>   `duration_without_traffic_seconds` (`None`); `routes.optimizedIntermediateWaypointIndex`
+>   → `waypoint_order` (`None`). Dropping every `routes.legs.*` field leaves the route with
+>   no legs, which raises `no_route`.
+> - Matrix: `distanceMeters` / `duration` → the cell values (`0`); `originIndex` /
+>   `destinationIndex` → the cell position (every cell lands on `0`); `status` / `condition`
+>   → reachability — an element carrying neither is treated as a failed cell, so dropping
+>   both omits every cell.
+> - Place details: `formattedAddress` → `formatted_address` (`""`); `id` → `place_id`
+>   (`None`); `viewport` → `viewport` (`None`); `displayName` → `name` (`None`, and only read
+>   when `NAME` is included). Dropping `location` returns `candidate=None`, since a candidate
+>   is never given a fabricated coordinate.
+>
+> Each mask field also selects Google's billing tier on Place Details, so adding a field there
+> can move the call onto a pricier SKU.

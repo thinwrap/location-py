@@ -13,6 +13,21 @@ The config type selects the provider; switching vendor is a one-line change::
 from __future__ import annotations
 
 from .config import EsriConfig, GoogleConfig, HereConfig, MapboxConfig, OsrmConfig, TomTomConfig
+from .defaults import (
+    GOOGLE_MATRIX_FIELD_MASK,
+    GOOGLE_PLACE_DETAILS_FIELD_MASK,
+    GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME,
+    GOOGLE_ROUTES_FIELD_MASK,
+    GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC,
+    GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER,
+    ESRI_MATRIX_ACCUMULATE_ATTRIBUTES,
+    ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING,
+    ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING,
+    HERE_MATRIX_ATTRIBUTES,
+    HERE_ROUTING_RETURN,
+    MAPBOX_MATRIX_ANNOTATIONS,
+    OSRM_TABLE_ANNOTATIONS,
+)
 from .enums import (
     HereTransportMode,
     IsochroneType,
@@ -39,7 +54,7 @@ from .geocoding import (
     ReverseGeocodeResult,
     Viewport,
 )
-from .isochrone import IsochroneContour, IsochroneMeta, IsochroneOptions, IsochroneResult, Polygon
+from .isochrone import IsochroneContour, IsochroneMeta, IsochroneOptions, IsochroneResult, MultiPolygon, Polygon
 from .latlng import LatLng
 from .matrix import MatrixCell, MatrixOptions, MatrixResult
 from .passthrough import Passthrough
@@ -60,6 +75,14 @@ __all__ = [
     "ConnectorError", "ProviderCode",
     # core types
     "LatLng", "Passthrough",
+    # connector default lists (passthrough replaces these wholesale)
+    "GOOGLE_ROUTES_FIELD_MASK", "GOOGLE_ROUTES_FIELD_MASK_DURATION_WITHOUT_TRAFFIC",
+    "GOOGLE_ROUTES_FIELD_MASK_WAYPOINT_ORDER", "GOOGLE_MATRIX_FIELD_MASK",
+    "GOOGLE_PLACE_DETAILS_FIELD_MASK", "GOOGLE_PLACE_DETAILS_FIELD_MASK_NAME",
+    "HERE_ROUTING_RETURN", "HERE_MATRIX_ATTRIBUTES",
+    "MAPBOX_MATRIX_ANNOTATIONS", "OSRM_TABLE_ANNOTATIONS",
+    "ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING", "ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING",
+    "ESRI_MATRIX_ACCUMULATE_ATTRIBUTES",
     # routing
     "RoutingOptions", "RoutingLeg", "RoutingResult",
     # matrix
@@ -69,7 +92,7 @@ __all__ = [
     "GeocodeCandidate", "GeocodeResult", "ReverseGeocodeResult",
     "AutocompletePrediction", "AutocompleteResult", "Viewport",
     # isochrone
-    "IsochroneOptions", "IsochroneContour", "IsochroneResult", "IsochroneMeta", "Polygon",
+    "IsochroneOptions", "IsochroneContour", "IsochroneResult", "IsochroneMeta", "Polygon", "MultiPolygon",
     # polyline
     "encode_polyline", "decode_polyline", "decode_flex_polyline", "encode_esri_paths",
     # transport

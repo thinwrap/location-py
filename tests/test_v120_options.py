@@ -172,9 +172,9 @@ def test_google_routing_departure_time_alone_stays_traffic_unaware():
         RoutingOptions(waypoints=TWO, departure_time=datetime(2026, 1, 1, 12, tzinfo=timezone.utc))
     )
     body = body_of(fake)
-    # The departure time is still sent — it affects scheduled routing — but it no
-    # longer upgrades the SKU on its own.
-    assert "departureTime" in body
+    # A departure time does not upgrade the SKU on its own, and it is dropped:
+    # Google 400s "Timestamp cannot be set for TRAFFIC_UNAWARE routing mode."
+    assert "departureTime" not in body
     assert body["routingPreference"] == "TRAFFIC_UNAWARE"
 
 
@@ -338,12 +338,15 @@ def test_google_leaves_the_field_none_when_the_vendor_omits_it():
 
 
 def test_here_omits_the_total_when_only_some_sections_carry_base_duration():
+    # One via, so each section is its own leg: the first arrives at via index 0.
     body = json.dumps({"routes": [{"sections": [
-        {"polyline": "BGwl_lgDo-6-T", "summary": {"length": 100, "duration": 10, "baseDuration": 9}},
-        {"polyline": "BGwl_lgDo-6-T", "summary": {"length": 100, "duration": 10}},
+        {"polyline": "BGwl_lgDo-6-T", "summary": {"length": 100, "duration": 10, "baseDuration": 9},
+         "arrival": {"place": {"type": "place", "location": {"lat": 1, "lng": 1}, "waypoint": 0}}},
+        {"polyline": "BGwl_lgDo-6-T", "summary": {"length": 100, "duration": 10},
+         "arrival": {"place": {"type": "place", "location": {"lat": 2, "lng": 2}}}},
     ]}]})
     res = Routing(HereConfig("k"), transport=FakeTransport(resp(200, body))).route(
-        RoutingOptions(waypoints=TWO, include=[RoutingInclude.DURATION_WITHOUT_TRAFFIC])
+        RoutingOptions(waypoints=[LatLng(0, 0), LatLng(1, 1), LatLng(2, 2)], include=[RoutingInclude.DURATION_WITHOUT_TRAFFIC])
     )
     # Under-reporting a total is worse than omitting it.
     assert res.total_duration_without_traffic_seconds is None

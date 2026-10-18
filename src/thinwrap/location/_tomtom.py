@@ -1,25 +1,28 @@
-"""TomTom connectors: routing, matrix (conditional sync/async at 2500 cells),
+"""TomTom connectors: routing, matrix (conditional sync/async at 100 cells),
 geocoding (Search v2), isochrone (calculateReachableRange, one call per value)."""
 
 from __future__ import annotations
 
 import time
 from typing import Any, Callable, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
+from ._contour_geometry import contour_geometry
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
-from ._util import decode_json, iso_string, ok_status
+from ._route_completeness import assert_route_has_legs
+from ._util import decode_json, iso_string, ok_status, traffic_requested
 from ._waypoint_order import is_complete_waypoint_order
 from .base import BaseConnector
 from .config import TomTomConfig
-from .coordinate import assert_finite, fmt_coord, to_lat_lng_string
-from .enums import IsochroneType, PlaceDetailsInclude, RoutingInclude, TrafficMode, TravelMode
+from .coordinate import assert_finite, assert_finite_number, fmt_coord, to_lat_lng_string
+from .enums import IsochroneType, PlaceDetailsInclude, RoutingInclude, TravelMode
 from .errors import (
     ConnectorError,
     ProviderCode,
     classified_error,
     invalid_request,
     provider_error,
+    require_list,
     unknown_error,
 )
 from .geocoding import (
@@ -36,7 +39,7 @@ from .geocoding import (
     ReverseGeocodeResult,
     Viewport,
 )
-from .isochrone import IsochroneContour, IsochroneMeta, IsochroneOptions, IsochroneResult, Polygon
+from .isochrone import IsochroneContour, IsochroneMeta, IsochroneOptions, IsochroneResult
 from .latlng import LatLng
 from .matrix import MatrixCell, MatrixOptions, MatrixResult
 from .passthrough import Passthrough, merge_passthrough
@@ -52,7 +55,13 @@ _REVERSE_URL = "https://api.tomtom.com/search/2/reverseGeocode"
 _SEARCH_URL = "https://api.tomtom.com/search/2/search"
 _PLACE_BY_ID_URL = "https://api.tomtom.com/search/2/place.json"
 _REACHABLE_RANGE_URL = "https://api.tomtom.com/routing/1/calculateReachableRange"
-_SYNC_CELL_THRESHOLD = 2500
+# TomTom's synchronous Matrix v2 accepts at most 100 cells by default; 200 only for
+# a narrow departAt=any/historical/fastest/car-or-truck request with no other
+# parameters, and 2500 only on Enterprise plans. The async endpoint takes up to
+# 2500 on a standard plan, so anything past 100 goes there. The 200 allowance is
+# deliberately not used: it would hold only while traffic stays historical, so a
+# LIVE request (or any extra option) of 101-200 cells would be rejected.
+_SYNC_CELL_THRESHOLD = 100
 
 
 class TomTomRoutingConnector(BaseConnector):
@@ -76,13 +85,22 @@ class TomTomRoutingConnector(BaseConnector):
             )
         locations = ":".join(to_lat_lng_string(w) for w in wps)
         url = f"{_ROUTE_URL}/{locations}/json"
-        base_query = {"key": self.cfg.api_key, "travelMode": _tomtom_travel_mode(opts.travel_mode), "routeType": "fastest", "routeRepresentation": "polyline"}
-        if opts.optimize and len(wps) > 2:
+        base_query: dict[str, Any] = {"key": self.cfg.api_key, "travelMode": _tomtom_travel_mode(opts.travel_mode), "routeType": "fastest", "routeRepresentation": "polyline"}
+        # Any of the three flags means "reorder", as on every other provider.
+        # computeBestOrder always keeps BOTH the first and the last waypoint fixed;
+        # TomTom has no way to free one end, so a single fixed endpoint is honoured
+        # and the other end stays fixed too.
+        wants_order = opts.optimize or opts.optimize_fixed_origin or opts.optimize_fixed_destination
+        if wants_order and len(wps) > 2:
             base_query["computeBestOrder"] = "true"
         # TomTom's `traffic` parameter defaults to ON at the vendor, so leaving it
         # unset would contradict the normalized default of TrafficMode.NONE. Send it
-        # explicitly in both directions.
-        base_query["traffic"] = "true" if opts.traffic_mode == TrafficMode.LIVE else "false"
+        # explicitly in both directions. TomTom routing has no time-independent
+        # mode: "the effect of historic traffic on effective road speeds is still
+        # incorporated" under traffic=false, and departAt=any is rejected (400
+        # "traffic=false not allowed in combination with departAt=any"), so NONE
+        # keeps the caller's departAt and is an approximation here.
+        base_query["traffic"] = "true" if traffic_requested(opts.traffic_mode) else "false"
 
         # noTrafficTravelTimeInSeconds only appears when computeTravelTimeFor=all is
         # requested, and that asks TomTom for extra computed values — so unlike
@@ -95,6 +113,8 @@ class TomTomRoutingConnector(BaseConnector):
             base_query["departAt"] = iso_string(opts.departure_time)
         av = _tomtom_avoids(opts)
         if av:
+            # A list, so the key is repeated: calculateRoute rejects a comma-joined
+            # value with 400 "Invalid avoid value: [tollRoads,motorways]".
             base_query["avoid"] = av
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         resp = self.send_get(url, m_headers, m_query)
@@ -106,17 +126,21 @@ class TomTomRoutingConnector(BaseConnector):
             raise classified_error(
                 ProviderCode.NO_ROUTE, resp.status, raw, "TomTom Routing returned no routes"
             )
-        route = routes[0]
+        route = routes[0] if isinstance(routes, list) else None
+        raw_legs = jget(route, "legs")
+        if not isinstance(route, dict) or not all(isinstance(l, dict) for l in (jlist(raw_legs) or [])):
+            raise unknown_error(resp.status, raw, "TomTom Routing returned a malformed route")
 
         legs: List[RoutingLeg] = []
         pts: List[LatLng] = []
-        for leg in route.get("legs") or []:
-            summ = leg.get("summary") or {}
-            no_traffic = summ.get("noTrafficTravelTimeInSeconds")
+        for leg in jlist(raw_legs) or []:
+            summ = leg.get("summary")
+            length, travel_time = _tomtom_length_and_time(summ, resp.status, raw)
+            no_traffic = jget(summ, "noTrafficTravelTimeInSeconds")
             legs.append(
                 RoutingLeg(
-                    jnum(summ.get("lengthInMeters")),
-                    jnum(summ.get("travelTimeInSeconds")),
+                    length,
+                    travel_time,
                     duration_without_traffic_seconds=(
                         float(no_traffic)
                         if wants_no_traffic
@@ -126,12 +150,18 @@ class TomTomRoutingConnector(BaseConnector):
                     ),
                 )
             )
-            for p in leg.get("points") or []:
-                pts.append(LatLng(jnum(p.get("latitude")), jnum(p.get("longitude"))))
+            for p in jlist(leg.get("points")) or []:
+                lat, lng = jnum_opt(jget(p, "latitude")), jnum_opt(jget(p, "longitude"))
+                if lat is None or lng is None:
+                    # A 0-filled point would draw the route through (0,0).
+                    raise unknown_error(resp.status, raw, "TomTom Routing returned a route point without coordinates")
+                pts.append(LatLng(lat, lng))
+
+        assert_route_has_legs(len(legs), len(wps), "TomTom Routing", raw, resp.status)
 
         waypoint_order = None
         ow = raw.get("optimizedWaypoints")
-        if opts.optimize and isinstance(ow, list):
+        if wants_order and isinstance(ow, list):
             ordered = sorted(ow, key=lambda w: jnum(w.get("optimizedIndex")))
             # TomTom optimizedWaypoints covers ONLY the intermediate waypoints
             # (providedIndex 0-based over intermediates, origin/destination
@@ -147,12 +177,13 @@ class TomTomRoutingConnector(BaseConnector):
             if is_complete_waypoint_order(candidate, len(opts.waypoints)):
                 waypoint_order = candidate
 
-        summary = route.get("summary") or {}
-        total_no_traffic = summary.get("noTrafficTravelTimeInSeconds")
+        summary = route.get("summary")
+        total_length, total_time = _tomtom_length_and_time(summary, resp.status, raw)
+        total_no_traffic = jget(summary, "noTrafficTravelTimeInSeconds")
         return RoutingResult(
             legs=legs,
-            total_distance_meters=jnum(summary.get("lengthInMeters")),
-            total_duration_seconds=jnum(summary.get("travelTimeInSeconds")),
+            total_distance_meters=total_length,
+            total_duration_seconds=total_time,
             polyline=encode_polyline(pts),
             waypoint_order=waypoint_order,
             raw=raw,
@@ -173,6 +204,8 @@ class TomTomMatrixConnector(BaseConnector):
         self._sleep = sleep or time.sleep
 
     def matrix(self, opts: MatrixOptions) -> MatrixResult:
+        if not opts.origins or not opts.destinations:
+            raise invalid_request("TomTom Matrix requires at least one origin and one destination")
         if len(opts.origins) * len(opts.destinations) <= _SYNC_CELL_THRESHOLD:
             return self._matrix_sync(opts)
         return self._matrix_async(opts)
@@ -183,11 +216,27 @@ class TomTomMatrixConnector(BaseConnector):
         for d in opts.destinations:
             assert_finite(d, "TomTom matrix destination")
         body: dict[str, Any] = {"origins": [{"point": {"latitude": o.lat, "longitude": o.lng}} for o in opts.origins], "destinations": [{"point": {"latitude": d.lat, "longitude": d.lng}} for d in opts.destinations]}
-        options: dict[str, Any] = {"travelMode": _tomtom_matrix_travel_mode(opts.travel_mode)}
+        traffic = traffic_requested(opts.traffic_mode)
+        options: dict[str, Any] = {
+            "travelMode": _tomtom_matrix_travel_mode(opts.travel_mode),
+            # Sent in both directions so trafficMode is honoured: "historical" is
+            # TomTom's own default (it has no traffic-free option), "live" opts in.
+            "traffic": "live" if traffic else "historical",
+        }
         if opts.avoid_tolls:
             options["avoid"] = ["tollRoads"]
-        if opts.departure_time:
+        if not traffic:
+            # "historical" + a real departAt applies typical traffic for that time;
+            # departAt "any" is TomTom's time-independent average ("tailored to
+            # the use case where the time context is irrelevant"), which is what
+            # NONE promises — so the caller's time is dropped.
+            options["departAt"] = "any"
+        elif opts.departure_time:
             options["departAt"] = iso_string(opts.departure_time)
+        else:
+            # departAt defaults to "any", which TomTom refuses to combine with live
+            # traffic (HTTP 400); live traffic only means something for "now".
+            options["departAt"] = "now"
         body["options"] = options
         return body, {"key": self.cfg.api_key}
 
@@ -242,6 +291,19 @@ class TomTomMatrixConnector(BaseConnector):
     def _retrieve(self, job_id: str, no: int, nd: int) -> MatrixResult:
         result_url = f"{_ASYNC_MATRIX_URL}/{quote(job_id, safe='')}/result"
         resp = self.send_get(result_url, None, {"key": self.cfg.api_key})
+        # TomTom answers a large result (over 1,000,000 items) with 302 and a
+        # temporary Location to download it from. The default transport never
+        # follows redirects, so the hop is taken here — once, and never cached,
+        # since TomTom says the URL may change.
+        if resp.status == 302:
+            location = next((v for k, v in resp.headers.items() if k.lower() == "location"), "")
+            if not location:
+                raise unknown_error(resp.status, None, "TomTom Matrix result redirect missing Location header")
+            if urlsplit(location).scheme.lower() != "https":
+                raise unknown_error(resp.status, None, "TomTom Matrix result redirect must be an https URL")
+            # The Location is a complete download URL that needs no key, and it may
+            # be on a storage host outside TomTom, so the key is not forwarded.
+            resp = self.send_get(location, None, None)
         if not ok_status(resp.status):
             raise _tomtom_http_error(resp.status, resp.headers, resp.body, True)
         return _tomtom_normalize_cells(resp.status, resp.body, no, nd)
@@ -261,12 +323,8 @@ class TomTomGeocodingConnector(BaseConnector):
             base_query["language"] = opts.language
         if opts.country_filter:
             base_query["countrySet"] = ",".join(opts.country_filter)
-        raw = self._get(url, base_query, opts.passthrough)
-        cands = [
-            c
-            for c in (_normalize_tomtom_candidate(r) for r in (jlist(jget(raw, "results")) or []))
-            if c is not None
-        ]
+        raw = self._get(url, base_query, opts.passthrough, "results", "TomTom Geocoding")
+        cands = [c for c in (_normalize_tomtom_candidate(r) for r in raw["results"]) if c is not None]
         return GeocodeResult(candidates=cands, raw=raw)
 
     def reverse_geocode(self, opts: ReverseGeocodeOptions) -> ReverseGeocodeResult:
@@ -275,9 +333,9 @@ class TomTomGeocodingConnector(BaseConnector):
         base_query = {"key": self.cfg.api_key}
         if opts.language:
             base_query["language"] = opts.language
-        raw = self._get(url, base_query, opts.passthrough)
+        raw = self._get(url, base_query, opts.passthrough, "addresses", "TomTom Reverse Geocoding")
         cands: List[GeocodeCandidate] = []
-        for a in jlist(jget(raw, "addresses")) or []:
+        for a in raw["addresses"]:
             pos = jstr(jget(a, "position"))
             parts = pos.split(",")
             if len(parts) != 2:
@@ -301,14 +359,15 @@ class TomTomGeocodingConnector(BaseConnector):
             base_query["lat"] = fmt_coord(opts.location.lat)
             base_query["lon"] = fmt_coord(opts.location.lng)
         if opts.radius is not None:
+            assert_finite_number(opts.radius, "TomTom autocomplete radius")
             base_query["radius"] = fmt_coord(opts.radius)
         # `country_filter` (ISO 3166-1 alpha-2) → TomTom `countrySet=<comma-csv>`,
         # same translation as forward geocode.
         if opts.country_filter:
             base_query["countrySet"] = ",".join(opts.country_filter)
-        raw = self._get(url, base_query, opts.passthrough)
+        raw = self._get(url, base_query, opts.passthrough, "results", "TomTom Search")
         preds: List[AutocompletePrediction] = []
-        for r in jlist(jget(raw, "results")) or []:
+        for r in raw["results"]:
             free = jstr(jget(jget(r, "address"), "freeformAddress"))
             poi_name = jstr(jget(jget(r, "poi"), "name"))
             desc = f"{poi_name}, {free}" if poi_name else free
@@ -331,14 +390,13 @@ class TomTomGeocodingConnector(BaseConnector):
             )
         return AutocompleteResult(predictions=preds, raw=raw)
 
-    def _get(self, url, base_query, pt):
+    def _get(self, url, base_query, pt, list_key: str, label: str):
         _, m_headers, m_query = merge_passthrough({}, {}, pt, base_query)
         resp = self.send_get(url, m_headers, m_query)
         if not ok_status(resp.status):
             raise _tomtom_http_error(resp.status, resp.headers, resp.body, False)
         raw = decode_json(resp.body)
-        if raw is None:
-            raise unknown_error(resp.status, None, "TomTom returned a non-JSON/unparseable body")
+        require_list(resp.status, raw, list_key, label)
         return raw
 
     def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
@@ -356,14 +414,13 @@ class TomTomGeocodingConnector(BaseConnector):
         raw = decode_json(resp.body)
         if not ok_status(resp.status):
             raise _tomtom_http_error(resp.status, resp.headers, resp.body, True)
+        require_list(resp.status, raw, "results", "TomTom Place Details")
 
         results = jlist(jget(raw, "results")) or []
         first = results[0] if results else None
         candidate = _normalize_tomtom_candidate(first) if first is not None else None
         if candidate is None:
-            raise classified_error(
-                ProviderCode.NO_ROUTE, resp.status, raw, "TomTom Place Details returned no result"
-            )
+            return PlaceDetailsResult(candidate=None, raw=raw)
 
         name = None
         if opts.includes(PlaceDetailsInclude.NAME):
@@ -378,12 +435,20 @@ class TomTomIsochroneConnector(BaseConnector):
         self.cfg = config
 
     def isochrone(self, opts: IsochroneOptions) -> IsochroneResult:
-        from .isochrone_validate import validate_isochrone_cap
+        from .isochrone_validate import isochrone_departure, validate_isochrone_cap
 
         validate_isochrone_cap(opts.values)
         assert_finite(opts.center, "TomTom isochrone center")
+        # calculateReachableRange accepts motorized modes only; TomTom states that
+        # "the values bicycle and pedestrian must not be used" there.
+        if opts.travel_mode in (TravelMode.WALKING, TravelMode.CYCLING):
+            msg = f'TomTom isochrone does not support travelMode "{TravelMode(opts.travel_mode).value}"'
+            raise ConnectorError(ProviderCode.UNSUPPORTED_TRAVEL_MODE, message=msg, provider_message=msg)
         base_url = f"{_REACHABLE_RANGE_URL}/{to_lat_lng_string(opts.center)}/json"
         travel_mode = _tomtom_travel_mode(opts.travel_mode)
+        depart_at = (
+            isochrone_departure(opts.departure_time, "TomTom Isochrone") if opts.departure_time is not None else None
+        )
 
         contours: List[IsochroneContour] = []
         raws: List[Any] = []
@@ -393,8 +458,8 @@ class TomTomIsochroneConnector(BaseConnector):
                 base_query["timeBudgetInSec"] = fmt_coord(value)
             else:
                 base_query["distanceBudgetInMeters"] = fmt_coord(value)
-            if opts.departure_time:
-                base_query["departAt"] = opts.departure_time
+            if depart_at is not None:
+                base_query["departAt"] = depart_at
             _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
             resp = self.send_get(base_url, m_headers, m_query)
             if not ok_status(resp.status):
@@ -402,18 +467,28 @@ class TomTomIsochroneConnector(BaseConnector):
             raw = decode_json(resp.body)
             raws.append(raw)
             boundary = jget(jget(raw, "reachableRange"), "boundary")
-            if not isinstance(boundary, list):
-                raise unknown_error(resp.status, raw, "TomTom Isochrone returned an unparseable or malformed body")
-            ring = [[jnum(jget(p, "longitude")), jnum(jget(p, "latitude"))] for p in boundary]
-            if ring:
-                ring.append([ring[0][0], ring[0][1]])
-            contours.append(IsochroneContour(value=value, geometry=Polygon(type="Polygon", coordinates=[ring])))
+            ring = [[jnum_opt(jget(p, "longitude")), jnum_opt(jget(p, "latitude"))] for p in (jlist(boundary) or [])]
+            if not ring or any(lng is None or lat is None for lng, lat in ring):
+                raise unknown_error(resp.status, raw, "TomTom Isochrone returned no usable boundary")
+            # One open boundary with no holes; closure and winding come from the
+            # shared contour rules.
+            contours.append(IsochroneContour(value=value, geometry=contour_geometry([[ring]])))
         contours.sort(key=lambda c: c.value)
         meta = IsochroneMeta(request_count=len(opts.values)) if len(opts.values) > 1 else None
         return IsochroneResult(contours=contours, raw=raws, meta=meta)
 
 
 # ---- shared tomtom helpers ----
+
+def _tomtom_length_and_time(summary: Any, status: int, raw: Any) -> tuple:
+    """A route or leg summary's ``lengthInMeters``/``travelTimeInSeconds``. TomTom
+    always sends both, so a missing one is a malformed response, not a free,
+    instant trip."""
+    length, travel_time = jnum_opt(jget(summary, "lengthInMeters")), jnum_opt(jget(summary, "travelTimeInSeconds"))
+    if length is None or travel_time is None:
+        raise unknown_error(status, raw, "TomTom Routing returned a summary without lengthInMeters/travelTimeInSeconds")
+    return length, travel_time
+
 
 def _tomtom_travel_mode(m: TravelMode) -> str:
     if m == TravelMode.WALKING:
@@ -432,7 +507,7 @@ def _tomtom_matrix_travel_mode(m: TravelMode) -> str:
     return "car"
 
 
-def _tomtom_avoids(opts: RoutingOptions) -> str:
+def _tomtom_avoids(opts: RoutingOptions) -> List[str]:
     a = []
     if opts.avoid_tolls:
         a.append("tollRoads")
@@ -440,22 +515,33 @@ def _tomtom_avoids(opts: RoutingOptions) -> str:
         a.append("ferries")
     if opts.avoid_highways:
         a.append("motorways")
-    return ",".join(a)
+    return a
 
 
 def _tomtom_normalize_cells(status: int, data: bytes, no: int, nd: int) -> MatrixResult:
     raw = decode_json(data)
-    if not isinstance(raw, dict):
-        raise unknown_error(status, raw, "TomTom Matrix returned non-JSON body")
+    entries = require_list(status, raw, "data", "TomTom Matrix")
     cells: List[MatrixCell] = []
-    for entry in raw.get("data") or []:
-        rs = entry.get("routeSummary")
-        if isinstance(rs, dict):
-            cells.append(MatrixCell(int(jnum(entry.get("originIndex"))), int(jnum(entry.get("destinationIndex"))), jnum(rs.get("lengthInMeters")), jnum(rs.get("travelTimeInSeconds"))))
+    for entry in entries:
+        oi, di = jget(entry, "originIndex"), jget(entry, "destinationIndex")
+        if not _is_index(oi, no) or not _is_index(di, nd):
+            # Without its indexes a cell cannot be placed; defaulting them to 0
+            # would pin its value onto the first origin/destination.
+            raise unknown_error(status, raw, "TomTom Matrix returned a cell without a valid origin/destination index")
+        rs = jget(entry, "routeSummary")
+        distance, duration = jnum_opt(jget(rs, "lengthInMeters")), jnum_opt(jget(rs, "travelTimeInSeconds"))
+        # A failed cell carries `detailedError` instead of a summary. Like one
+        # missing either value, it is omitted rather than reported as 0 m / 0 s.
+        if distance is not None and duration is not None:
+            cells.append(MatrixCell(oi, di, distance, duration))
     # A sparse result (fewer routable cells than the requested grid) is normal:
     # an unroutable origin×destination pair is OMITTED, not an error for the whole
     # matrix — parity with the Mapbox/OSRM/HERE/Google cell-omission semantics.
     return MatrixResult(cells=cells, raw=raw)
+
+
+def _is_index(value: Any, size: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < size
 
 
 def _tomtom_map_vendor_error(status: int, with_404: bool) -> ProviderCode:
@@ -522,14 +608,16 @@ def _normalize_tomtom_candidate(r: Any) -> Optional[GeocodeCandidate]:
     Returns ``None`` when the result has no real position — the caller skips it
     rather than emitting a fabricated (0,0) "Null Island" candidate.
     """
-    pos = jget(r, "position") or {}
-    lat, lon = jnum_opt(pos.get("lat")), jnum_opt(pos.get("lon"))
+    pos = jget(r, "position")
+    lat, lon = jnum_opt(jget(pos, "lat")), jnum_opt(jget(pos, "lon"))
     if lat is None or lon is None:
         return None
     viewport = None
     vp = jget(r, "viewport")
-    if isinstance(vp, dict):
-        tl, br = jget(vp, "topLeftPoint"), jget(vp, "btmRightPoint")
-        if isinstance(tl, dict) and isinstance(br, dict):
-            viewport = Viewport(LatLng(jnum(br.get("lat")), jnum(tl.get("lon"))), LatLng(jnum(tl.get("lat")), jnum(br.get("lon"))))
+    tl, br = jget(vp, "topLeftPoint"), jget(vp, "btmRightPoint")
+    corners = [jnum_opt(jget(br, "lat")), jnum_opt(jget(tl, "lon")), jnum_opt(jget(tl, "lat")), jnum_opt(jget(br, "lon"))]
+    # A partial viewport is dropped whole rather than 0-filled.
+    if all(c is not None for c in corners):
+        south, west, north, east = corners
+        viewport = Viewport(LatLng(south, west), LatLng(north, east))
     return GeocodeCandidate(formatted_address=jstr(jget(jget(r, "address"), "freeformAddress")), location=LatLng(lat, lon), place_id=jstr(jget(r, "id")) or None, viewport=viewport)

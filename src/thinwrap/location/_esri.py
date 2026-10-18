@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
+from ._contour_geometry import contour_geometry, esri_parts
 from ._jsonpath import jget, jlist, jnum, jnum_opt, jstr
-from ._util import compact_json, decode_json, ok_status
+from ._util import compact_json, decode_json, ok_status, traffic_requested
 from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import EsriConfig
 from .coordinate import assert_finite, fmt_coord, to_lng_lat_string
+from .defaults import (
+    ESRI_MATRIX_ACCUMULATE_ATTRIBUTES,
+    ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING,
+    ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING,
+)
 from .enums import IsochroneType, PlaceDetailsInclude, TravelMode
-from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, unknown_error
+from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, require_list, unknown_error
 from .geocoding import (
     AutocompleteOptions,
     AutocompletePrediction,
@@ -28,7 +34,7 @@ from .geocoding import (
     ReverseGeocodeResult,
     Viewport,
 )
-from .isochrone import IsochroneContour, IsochroneOptions, IsochroneResult, Polygon
+from .isochrone import IsochroneContour, IsochroneOptions, IsochroneResult
 from .latlng import LatLng
 from .matrix import MatrixCell, MatrixOptions, MatrixResult
 from .passthrough import merge_passthrough
@@ -54,6 +60,33 @@ def _esri_epoch_ms(d: _dt.datetime) -> str:
     if d.tzinfo is None:
         d = d.replace(tzinfo=_dt.timezone.utc)
     return str(int(d.timestamp() * 1000))
+
+
+def _esri_departure_epoch_ms(value: Any, label: str) -> str:
+    """A departure time as Esri epoch milliseconds, for ``startTime`` / ``timeOfDay``.
+
+    Accepts a ``datetime`` or an ISO-8601 string. A string that does not parse, or
+    a value that cannot be converted, is an ``invalid_request`` — dropping it would
+    silently compute a time-independent answer the caller did not ask for. Any
+    other type is a ``TypeError``: a bug in the calling code, not request data.
+
+    The value is an absolute instant, so every caller pairs it with
+    ``startTimeIsUTC`` / ``timeOfDayIsUTC`` = ``true``: both default to ``false``,
+    which makes Esri read the number as a clock time in the first stop's (or
+    facility's) local time zone and shift it by that zone's UTC offset.
+    """
+    when = value
+    if isinstance(when, str):
+        try:
+            when = _dt.datetime.fromisoformat(when.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise invalid_request(f"{label} departure_time is not a valid ISO-8601 datetime: {value!r}") from exc
+    if not isinstance(when, _dt.datetime):
+        raise TypeError(f"{label} departure_time must be a datetime or an ISO-8601 string, got {type(value).__name__}")
+    try:
+        return _esri_epoch_ms(when)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise invalid_request(f"{label} departure_time cannot be converted to epoch milliseconds: {value!r}") from exc
 
 
 def resolve_esri_bearer_token(cfg: EsriConfig) -> str:
@@ -106,28 +139,44 @@ class EsriRoutingConnector(_EsriBase):
             # ships the whole turn-by-turn payload.
             "returnDirections": "false",
             # Produces the ``Cumul_<attr>`` fields; no ``impedanceAttributeName`` needed.
-            "accumulateAttributeNames": f"{_esri_time_attribute_for(opts.travel_mode)},Kilometers",
+            "accumulateAttributeNames": ",".join(_esri_routing_accumulate_attributes(opts.travel_mode)),
             # Only ``paths`` is read; ``...WithMeasure`` adds an m-value per point.
             "outputLines": "esriNAOutputLineTrueShape",
             "outSR": "4326",
+            # The service default is ``true``, which silently drops a stop it cannot
+            # snap to the network and routes the remaining ones — a route that skips
+            # a requested stop. ``false`` makes Esri fail the request instead, and
+            # that in-body error names the stop as unlocated (mapped to NO_ROUTE).
+            "ignoreInvalidLocations": "false",
         }
-        if opts.optimize:
+        wants_order = _esri_wants_best_sequence(opts)
+        if wants_order:
             form["findBestSequence"] = "true"
-            # Needed to recover the optimized visiting order: the `stops`
-            # FeatureSet carries each stop's 1-based Sequence (there is no
-            # `Stops` route attribute).
-            if opts.optimize_fixed_origin:
-                form["preserveFirstStop"] = "true"
-            if opts.optimize_fixed_destination:
-                form["preserveLastStop"] = "true"
-        tm = _esri_travel_mode(opts.travel_mode, "ESRI Routing")
-        if tm:
-            form["travelMode"] = tm
-        r = _esri_routing_restrictions(opts)
-        if r:
-            form["restrictionAttributeNames"] = r
-        if opts.departure_time:
-            form["startTime"] = _esri_epoch_ms(opts.departure_time)
+            # Both preserve flags default to TRUE once findBestSequence is on
+            # (live: order [0,1,2,3] with defaults, [2,3,0,1] with both false), so
+            # they are always sent explicitly: freeing an end means sending false.
+            first, last = _esri_preserve_stops(opts)
+            form["preserveFirstStop"] = "true" if first else "false"
+            form["preserveLastStop"] = "true" if last else "false"
+        _esri_apply_travel_mode_and_restrictions(
+            form, opts.travel_mode, _esri_routing_restrictions(opts), "ESRI Routing"
+        )
+        # Esri applies traffic whenever a start time is sent (typical, or live
+        # within 4 h of now) and none at all without one, so the time follows
+        # traffic_mode rather than departure_time: NONE drops it, and traffic with
+        # no time asks for `now` ("live traffic will be used where available";
+        # Esri forces startTimeIsUTC=true itself). A passthrough startTime still
+        # wins, being merged afterwards. A malformed time is still refused under
+        # NONE: it is a caller bug either way.
+        start_ms = (
+            _esri_departure_epoch_ms(opts.departure_time, "ESRI Routing") if opts.departure_time is not None else None
+        )
+        if traffic_requested(opts.traffic_mode):
+            if start_ms is not None:
+                form["startTime"] = start_ms
+                form["startTimeIsUTC"] = "true"
+            else:
+                form["startTime"] = "now"
 
         resp = self._post_form(_ROUTE_URL, form, opts.passthrough)
         if not ok_status(resp.status):
@@ -147,10 +196,15 @@ class EsriRoutingConnector(_EsriBase):
                 ProviderCode.NO_ROUTE, resp.status, raw, "ESRI Routing returned no routes"
             )
         feature = features[0]
-        attrs = jget(feature, "attributes") or {}
+        attrs = jget(feature, "attributes")
+        if not isinstance(attrs, dict):
+            attrs = {}
 
         # Legs and totals share one source, so they always reconcile.
-        cumulative = _esri_cumulative_stop_costs(jlist(jget(jget(raw, "stops"), "features")) or [])
+        time_attr = _esri_routing_accumulate_attributes(opts.travel_mode)[0]
+        cumulative = _esri_cumulative_stop_costs(
+            jlist(jget(jget(raw, "stops"), "features")) or [], time_attr
+        )
         if cumulative is not None:
             total_dist, total_dur, legs = cumulative
         else:
@@ -158,18 +212,26 @@ class EsriRoutingConnector(_EsriBase):
             # configured without the accumulate attributes returns none. The route's
             # own totals are named after the active impedance.
             total_dist = _esri_route_total_distance_meters(attrs)
-            total_dur = _esri_route_total_duration_seconds(attrs)
+            total_dur = _esri_route_total_duration_seconds(attrs, time_attr)
+            if total_dist is None or total_dur is None:
+                # Neither the stops nor the route carry a cost this decoder can
+                # read; a 0 m / 0 s route would be indistinguishable from real data.
+                raise unknown_error(resp.status, raw, "ESRI Routing returned no readable route distance/duration")
             legs = _esri_even_split_legs(len(wps), total_dist, total_dur)
         pts: List[LatLng] = []
-        for path in (jget(jget(feature, "geometry"), "paths") or []):
-            for point in path:
-                if isinstance(point, list) and len(point) >= 2:
-                    pts.append(LatLng(point[1], point[0]))
-        # Optimized routes only. Stops are always fetched now, so without this gate an
-        # unoptimized route would report a useless identity permutation.
+        for path in jlist(jget(jget(feature, "geometry"), "paths")) or []:
+            for point in jlist(path) or []:
+                x, y = (jnum_opt(point[0]), jnum_opt(point[1])) if isinstance(point, list) and len(point) >= 2 else (None, None)
+                if x is None or y is None:
+                    raise unknown_error(resp.status, raw, "ESRI Routing returned a route path point without coordinates")
+                pts.append(LatLng(y, x))
+        # Optimized routes only: stops are always fetched, so without this gate an
+        # unoptimized route would report a useless identity permutation. The
+        # `stops` FeatureSet carries each stop's 1-based Sequence (there is no
+        # `Stops` route attribute).
         waypoint_order = (
             _esri_waypoint_order(jlist(jget(jget(raw, "stops"), "features")) or [], len(wps))
-            if opts.optimize
+            if wants_order
             else None
         )
 
@@ -199,16 +261,24 @@ class EsriMatrixConnector(_EsriBase):
             "destinations": _esri_point_feature_set(opts.destinations),
             "outputType": "esriNAODOutputSparseMatrix",
             "impedanceAttributeName": "TravelTime",
-            "accumulateAttributeNames": "Kilometers",
+            "accumulateAttributeNames": ",".join(ESRI_MATRIX_ACCUMULATE_ATTRIBUTES),
             "outSR": "4326",
         }
-        tm = _esri_travel_mode(opts.travel_mode, "ESRI Matrix")
-        if tm:
-            form["travelMode"] = tm
-        if opts.avoid_tolls:
-            form["restrictionAttributeNames"] = "Avoid Toll Roads"
-        if opts.departure_time:
-            form["startTime"] = _esri_epoch_ms(opts.departure_time)
+        _esri_apply_travel_mode_and_restrictions(
+            form, opts.travel_mode, ["Avoid Toll Roads"] if opts.avoid_tolls else [], "ESRI Matrix"
+        )
+        # solveODCostMatrix documents no ``startTime`` parameter; its departure is
+        # ``timeOfDay``. Same traffic rule as routing: a time is what turns traffic
+        # on, so NONE drops it and traffic with no time sends `now`.
+        time_ms = (
+            _esri_departure_epoch_ms(opts.departure_time, "ESRI Matrix") if opts.departure_time is not None else None
+        )
+        if traffic_requested(opts.traffic_mode):
+            if time_ms is not None:
+                form["timeOfDay"] = time_ms
+                form["timeOfDayIsUTC"] = "true"
+            else:
+                form["timeOfDay"] = "now"
 
         resp = self._post_form(_MATRIX_URL, form, opts.passthrough)
         if not ok_status(resp.status):
@@ -234,6 +304,16 @@ class EsriMatrixConnector(_EsriBase):
                     time_idx = attr_order.index(name)
                     break
             dist_idx = attr_order.index("Kilometers") if "Kilometers" in attr_order else -1
+            if time_idx < 0 or dist_idx < 0:
+                # A cost column this decoder does not recognise (a travel mode with
+                # another impedance, or a passthrough override) must not read as 0
+                # seconds / 0 metres — that is indistinguishable from "same place".
+                raise unknown_error(
+                    resp.status,
+                    {"costAttributeNames": attr_order},
+                    "ESRI Matrix returned cost columns without a recognised time "
+                    f"({'/'.join(_ESRI_TIME_ATTRIBUTE_NAMES)}) and Kilometers column: {attr_order}",
+                )
             cells: List[MatrixCell] = []
             for origin_key, dest_map in odm.items():
                 if origin_key == "costAttributeNames":
@@ -246,7 +326,10 @@ class EsriMatrixConnector(_EsriBase):
                     if did is None or not (1 <= did <= nd):
                         raise unknown_error(resp.status, raw, "ESRI Matrix sparse response returned an out-of-range or non-numeric destination OID")
                     t, d = _esri_decode_cost_cell(cell, time_idx, dist_idx)
-                    cells.append(MatrixCell(oid - 1, did - 1, d * _KM_TO_M, t * _MIN_TO_SEC))
+                    # A cell missing either cost is a failed cell, omitted rather
+                    # than reported as 0 m / 0 s.
+                    if t is not None and d is not None:
+                        cells.append(MatrixCell(oid - 1, did - 1, d * _KM_TO_M, t * _MIN_TO_SEC))
             # A sparse result (fewer routable cells than the requested grid) is
             # normal: an unroutable origin×destination pair is OMITTED, not an error
             # for the whole matrix — parity with the other providers' cell omission.
@@ -254,15 +337,21 @@ class EsriMatrixConnector(_EsriBase):
 
         odl = jget(raw, "odLines")
         if isinstance(odl, dict):
+            # The line-feature output names its costs `Total_<attribute>` after the
+            # active impedance, like the sparse matrix's columns: Total_WalkTime
+            # when walking, so reading Total_TravelTime there would report 0 s.
+            time_key = "Total_" + ("WalkTime" if opts.travel_mode == TravelMode.WALKING else "TravelTime")
             cells = []
             for f in jlist(jget(odl, "features")) or []:
-                a = jget(f, "attributes") or {}
-                oid, did = jnum(a.get("OriginID")), jnum(a.get("DestinationID"))
-                if oid < 1 or did < 1:
-                    raise unknown_error(resp.status, raw, "ESRI Matrix odLines returned a non-positive or non-finite OID; cannot map to a 0-based cell index")
-                cells.append(MatrixCell(int(oid) - 1, int(did) - 1, jnum(a.get("Total_Kilometers")) * _KM_TO_M, jnum(a.get("Total_TravelTime")) * _MIN_TO_SEC))
-            if len(cells) < no * nd:
-                raise unknown_error(resp.status, raw, "ESRI Matrix returned a matrix that does not match the requested dimensions")
+                a = jget(f, "attributes")
+                oid, did = _esri_matrix_oid(jget(a, "OriginID")), _esri_matrix_oid(jget(a, "DestinationID"))
+                if oid is None or did is None or not (1 <= oid <= no) or not (1 <= did <= nd):
+                    raise unknown_error(resp.status, raw, "ESRI Matrix odLines returned an out-of-range or non-integer OID")
+                km, minutes = jnum_opt(jget(a, "Total_Kilometers")), jnum_opt(jget(a, time_key))
+                # Same omission rule as the sparse matrix: an unroutable pair has
+                # no line or no cost, and is left out rather than reported as 0.
+                if km is not None and minutes is not None:
+                    cells.append(MatrixCell(oid - 1, did - 1, km * _KM_TO_M, minutes * _MIN_TO_SEC))
             return MatrixResult(cells=cells, raw=raw)
 
         raise unknown_error(resp.status, raw, "ESRI Matrix response missing odCostMatrix and odLines payload")
@@ -276,20 +365,16 @@ class EsriGeocodingConnector(_EsriBase):
             query["countryCode"] = ",".join(opts.country_filter)
         if opts.language:
             query["langCode"] = opts.language
-        raw = self._dispatch_get(_GEOCODE_URL, query, opts.passthrough, "ESRI geocoding failed")
+        raw = self._dispatch_get(_GEOCODE_URL, query, opts.passthrough, "ESRI geocoding failed", list_key="candidates")
         cands: List[GeocodeCandidate] = []
-        for ci in jlist(jget(raw, "candidates")) or []:
-            loc = jget(ci, "location") or {}
+        for ci in raw["candidates"]:
+            loc = jget(ci, "location")
             # Skip a candidate without real coordinates rather than emitting a
             # fabricated (0,0) "Null Island" position.
-            y, x = jnum_opt(loc.get("y")), jnum_opt(loc.get("x"))
+            y, x = jnum_opt(jget(loc, "y")), jnum_opt(jget(loc, "x"))
             if y is None or x is None:
                 continue
-            viewport = None
-            ext = jget(ci, "extent")
-            if isinstance(ext, dict):
-                viewport = Viewport(LatLng(jnum(ext.get("ymin")), jnum(ext.get("xmin"))), LatLng(jnum(ext.get("ymax")), jnum(ext.get("xmax"))))
-            cands.append(GeocodeCandidate(formatted_address=jstr(jget(ci, "address")), location=LatLng(y, x), viewport=viewport))
+            cands.append(GeocodeCandidate(formatted_address=jstr(jget(ci, "address")), location=LatLng(y, x), viewport=_esri_extent_viewport(jget(ci, "extent"))))
         return GeocodeResult(candidates=cands, raw=raw)
 
     def reverse_geocode(self, opts: ReverseGeocodeOptions) -> ReverseGeocodeResult:
@@ -298,7 +383,9 @@ class EsriGeocodingConnector(_EsriBase):
         query: dict[str, Any] = {"f": "json", "token": token, "location": to_lng_lat_string(opts.location)}
         if opts.language:
             query["langCode"] = opts.language
-        raw = self._dispatch_get(_REVGEOCODE_URL, query, opts.passthrough, "ESRI reverse geocoding failed")
+        raw = self._dispatch_get(
+            _REVGEOCODE_URL, query, opts.passthrough, "ESRI reverse geocoding failed", no_address_is_empty=True
+        )
         addr, loc = jget(raw, "address"), jget(raw, "location")
         if addr is None or loc is None:
             return ReverseGeocodeResult(candidates=[], raw=raw)
@@ -321,11 +408,11 @@ class EsriGeocodingConnector(_EsriBase):
         # directly), same translation as forward geocode.
         if opts.country_filter:
             query["countryCode"] = ",".join(opts.country_filter)
-        raw = self._dispatch_get(_SUGGEST_URL, query, opts.passthrough, "ESRI autocomplete failed")
-        preds = [AutocompletePrediction(description=jstr(jget(s, "text")), place_id=jstr(jget(s, "magicKey")) or None) for s in (jlist(jget(raw, "suggestions")) or [])]
+        raw = self._dispatch_get(_SUGGEST_URL, query, opts.passthrough, "ESRI autocomplete failed", list_key="suggestions")
+        preds = [AutocompletePrediction(description=jstr(jget(s, "text")), place_id=jstr(jget(s, "magicKey")) or None) for s in raw["suggestions"]]
         return AutocompleteResult(predictions=preds, raw=raw)
 
-    def _dispatch_get(self, url, base_query, pt, label):
+    def _dispatch_get(self, url, base_query, pt, label, *, list_key: Optional[str] = None, no_address_is_empty: bool = False):
         m_body, m_headers, m_query = merge_passthrough(base_query, {}, pt, None)
         final_query = {k: _esri_stringify(v) for k, v in m_body.items() if v is not None}
         final_query.update(m_query)
@@ -333,10 +420,19 @@ class EsriGeocodingConnector(_EsriBase):
         if not ok_status(resp.status):
             raise _esri_http_error(resp.status, resp.headers, resp.body)
         raw = decode_json(resp.body)
-        if raw is None:
-            raise unknown_error(resp.status, None, f"{label}: non-JSON body")
+        if not isinstance(raw, dict):
+            raise unknown_error(resp.status, raw, f"{label}: non-JSON body")
         if jget(raw, "error") is not None:
+            # reverseGeocode reports a location with no address nearby as an
+            # in-body error 400 ("Unable to find address for the specified
+            # location."). That is the zero-results answer, not a bad request, so
+            # the body goes back to the caller, whose missing-address branch turns
+            # it into an empty result.
+            if no_address_is_empty and _esri_is_no_address(raw):
+                return raw
             raise _esri_body_error(resp.status, raw)
+        if list_key is not None:
+            require_list(resp.status, raw, list_key, label)
         return raw
 
     def place_details(self, opts: PlaceDetailsOptions) -> PlaceDetailsResult:
@@ -346,10 +442,9 @@ class EsriGeocodingConnector(_EsriBase):
         geocode, so the same normalizer applies.
 
         **Live-verified that ``magicKey`` alone is sufficient.** Esri's docs pair it
-        with the original ``SingleLine`` text, and the plan here originally did too;
-        probing showed the key on its own resolves to the byte-identical candidate.
-        That is why ``place_id`` needs no companion field — our ``place_id`` IS the
-        magicKey.
+        with the original ``SingleLine`` text, but the key on its own resolves to the
+        byte-identical candidate. That is why ``place_id`` needs no companion field —
+        our ``place_id`` IS the magicKey.
         """
         query = {
             "f": "json",
@@ -364,33 +459,15 @@ class EsriGeocodingConnector(_EsriBase):
 
         cands = jlist(jget(raw, "candidates")) or []
         first = cands[0] if cands else None
-        if first is None:
-            raise classified_error(
-                ProviderCode.NO_ROUTE, None, raw, "ESRI Place Details returned no candidate"
-            )
-
-        loc = jget(first, "location") or {}
-        y, x = jnum_opt(loc.get("y")), jnum_opt(loc.get("x"))
+        loc = jget(first, "location")
+        y, x = jnum_opt(jget(loc, "y")), jnum_opt(jget(loc, "x"))
         if y is None or x is None:
-            raise classified_error(
-                ProviderCode.NO_ROUTE, None, raw, "ESRI Place Details returned no location"
-            )
-
-        viewport = None
-        ext = jget(first, "extent")
-        if isinstance(ext, dict):
-            corners = [
-                jnum_opt(ext.get("ymin")), jnum_opt(ext.get("xmin")),
-                jnum_opt(ext.get("ymax")), jnum_opt(ext.get("xmax")),
-            ]
-            if all(c is not None for c in corners):
-                ymin, xmin, ymax, xmax = corners
-                viewport = Viewport(LatLng(ymin, xmin), LatLng(ymax, xmax))
+            return PlaceDetailsResult(candidate=None, raw=raw)
 
         candidate = GeocodeCandidate(
             formatted_address=jstr(jget(first, "address")),
             location=LatLng(y, x),
-            viewport=viewport,
+            viewport=_esri_extent_viewport(jget(first, "extent")),
         )
 
         # Esri returns only an address — there is no separate display name to
@@ -408,40 +485,45 @@ class EsriIsochroneConnector(_EsriBase):
             raise ConnectorError(ProviderCode.UNSUPPORTED_TRAVEL_MODE, message="ESRI isochrone does not support cycling", provider_message="ESRI isochrone does not support cycling")
         token = resolve_esri_bearer_token(self.cfg)
 
-        if opts.type == IsochroneType.TIME:
-            # ESRI accepts FRACTIONAL minutes, so convert seconds losslessly rather
-            # than rounding to whole minutes (which corrupted sub-minute breaks: 30s
-            # → 1 min → 60s, and 20s → 0). `:g` on a 6-decimal round strips float noise
-            # and trailing zeros (5.0 → "5", 0.5 → "0.5", 20s → "0.333333").
-            breaks = ",".join(f"{round(v / 60, 6):g}" for v in opts.values)
-            break_units = "esriDriveTimeUnitsMinutes"
-        else:
-            breaks = ",".join(fmt_coord(v) for v in opts.values)
-            break_units = "esriDriveDistanceUnitsMeters"
+        # solveServiceArea has no break-units parameter: ``defaultBreaks`` is read in
+        # the units of the active impedance attribute (TravelTime → minutes by
+        # default). A distance isochrone therefore switches the impedance to
+        # Kilometers and sends kilometres.
+        is_time = opts.type == IsochroneType.TIME
+        # ESRI accepts FRACTIONAL minutes / kilometres, so sub-minute breaks survive
+        # (whole minutes would turn 30 s into 60 s and 20 s into 0). Six decimals
+        # strip float noise; fmt_coord never switches to exponent notation.
+        # `sent` maps each break as sent back to the caller's value: 7 s goes out
+        # as 0.116667 min and ToBreak echoes that, which ×60 would read as 7.00002 s.
+        sent = {
+            round(v / 60, 6) if is_time else round(v / _KM_TO_M, 6): v for v in opts.values
+        }
+        breaks = ",".join(fmt_coord(b) for b in sent)
         form: dict[str, Any] = {
             "f": "json",
             "token": token,
             "facilities": _esri_point_feature_set([opts.center]),
             "defaultBreaks": breaks,
-            "breakUnits": break_units,
-            "outputPolygons": "esriNAOutputPolygonDetailed",
+            "outputPolygons": _esri_output_polygons(opts),
             "returnFacilities": "false",
             "travelDirection": "esriNATravelDirectionFromFacility",
             "outSR": "4326",
         }
         if opts.travel_mode == TravelMode.WALKING:
-            # ArcGIS requires a full travel-mode JSON object, not a name string.
-            form["travelMode"] = _esri_walking_travel_mode_json()
+            # ArcGIS requires a full travel-mode JSON object, not a name string. A
+            # travel mode overrides ``impedanceAttributeName``, so the distance
+            # impedance has to be set inside the object itself.
+            form["travelMode"] = (
+                _esri_walking_travel_mode_json() if is_time else _esri_walking_distance_travel_mode_json()
+            )
+        elif not is_time:
+            form["impedanceAttributeName"] = "Kilometers"
+        # Isochrones have no traffic_mode, so a departure time is passed through
+        # as given — which makes the service area traffic-aware (typical traffic,
+        # or live within 4 h of now), as documented.
         if opts.departure_time:
-            try:
-                t = _dt.datetime.fromisoformat(opts.departure_time.replace("Z", "+00:00"))
-            except ValueError as exc:
-                # An unparseable departure_time was silently dropped — surface it
-                # rather than quietly ignoring the caller's request.
-                raise invalid_request(
-                    f"Esri isochrone departure_time is not a valid ISO-8601 datetime: {opts.departure_time!r}"
-                ) from exc
-            form["timeOfDay"] = _esri_epoch_ms(t)
+            form["timeOfDay"] = _esri_departure_epoch_ms(opts.departure_time, "ESRI Isochrone")
+            form["timeOfDayIsUTC"] = "true"
 
         resp = self._post_form(_SERVICE_AREA_URL, form, opts.passthrough)
         if not ok_status(resp.status):
@@ -453,16 +535,33 @@ class EsriIsochroneConnector(_EsriBase):
             raise _esri_body_error(resp.status, raw)
         contours: List[IsochroneContour] = []
         for f in jlist(jget(jget(raw, "saPolygons"), "features")) or []:
-            rings = jget(jget(f, "geometry"), "rings") or []
-            outer = rings[0] if rings else []
-            to_break = jnum(jget(jget(f, "attributes"), "ToBreak"))
-            value = to_break * _MIN_TO_SEC if opts.type == IsochroneType.TIME else to_break
-            contours.append(IsochroneContour(value=value, geometry=Polygon(type="Polygon", coordinates=[outer])))
+            # `rings` mixes exterior and hole rings in no guaranteed order (rings[0]
+            # may be a hole), and a service area can have several exteriors.
+            rings = [r for r in jlist(jget(jget(f, "geometry"), "rings")) or [] if _esri_is_ring(r)]
+            to_break = jnum_opt(jget(jget(f, "attributes"), "ToBreak"))
+            if to_break is None or not rings:
+                raise unknown_error(resp.status, raw, "ESRI Isochrone returned a polygon without a ToBreak value or outer ring")
+            # A break the connector did not send (a passthrough override) falls back
+            # to a unit conversion, rounded so 0.3 km reads back as 300 m.
+            fallback = to_break * _MIN_TO_SEC if is_time else round(to_break * _KM_TO_M, 6)
+            value = sent.get(round(to_break, 6), fallback)
+            contours.append(IsochroneContour(value=value, geometry=contour_geometry(esri_parts(rings))))
+        if not contours:
+            raise unknown_error(resp.status, raw, "ESRI Isochrone returned no service-area polygons")
         contours.sort(key=lambda c: c.value)
         return IsochroneResult(contours=contours, raw=raw)
 
 
 # ---- shared esri helpers ----
+
+def _esri_is_ring(ring: Any) -> bool:
+    """Whether ``ring`` is a non-empty list of ``[x, y]`` number pairs."""
+    return (
+        isinstance(ring, list)
+        and bool(ring)
+        and all(isinstance(p, list) and len(p) >= 2 and jnum_opt(p[0]) is not None and jnum_opt(p[1]) is not None for p in ring)
+    )
+
 
 def _esri_point_feature_set(points) -> str:
     features = [{"geometry": {"x": p.lng, "y": p.lat, "spatialReference": {"wkid": 4326}}} for p in points]
@@ -517,16 +616,101 @@ def _esri_walking_travel_mode_json() -> str:
     return json.dumps(_esri_walking_travel_mode(), separators=(",", ":"), ensure_ascii=False)
 
 
-def _esri_travel_mode(m: TravelMode, label: str) -> str:
+def _esri_walking_distance_travel_mode() -> dict:
+    """Esri's "Walking Distance" travel mode, for distance isochrones.
+
+    A travel mode overrides ``impedanceAttributeName``, and service-area breaks are
+    read in the impedance's units — so under "Walking Time" a kilometre break would
+    be interpreted as minutes of walking. This is the object Esri publishes in its
+    "Retrieve travel modes" reference (id ``yFuMFwIYblqKEefX``, Kilometers impedance).
+    """
+    return {
+        "attributeParameterValues": [
+            {"parameterName": "Restriction Usage", "attributeName": "Avoid Private Roads", "value": "AVOID_MEDIUM"},
+            {"parameterName": "Restriction Usage", "attributeName": "Walking", "value": "PROHIBITED"},
+            {"parameterName": "Restriction Usage", "attributeName": "Preferred for Pedestrians", "value": "PREFER_LOW"},
+            {"parameterName": "Walking Speed (km/h)", "attributeName": "WalkTime", "value": 5},
+            {
+                "parameterName": "Restriction Usage",
+                "attributeName": "Avoid Roads Unsuitable for Pedestrians",
+                "value": "AVOID_HIGH",
+            },
+        ],
+        "description": "Follows paths and roads that allow pedestrian traffic and finds solutions that optimize travel distance.",
+        "distanceAttributeName": "Kilometers",
+        "id": "yFuMFwIYblqKEefX",
+        "impedanceAttributeName": "Kilometers",
+        "name": "Walking Distance",
+        "restrictionAttributeNames": [
+            "Avoid Private Roads",
+            "Avoid Roads Unsuitable for Pedestrians",
+            "Preferred for Pedestrians",
+            "Walking",
+        ],
+        "simplificationTolerance": 2,
+        "simplificationToleranceUnits": "esriMeters",
+        "timeAttributeName": "WalkTime",
+        "type": "WALK",
+        "useHierarchy": False,
+        "uturnAtJunctions": "esriNFSBAllowBacktrack",
+    }
+
+
+def _esri_walking_distance_travel_mode_json() -> str:
+    return json.dumps(_esri_walking_distance_travel_mode(), separators=(",", ":"), ensure_ascii=False)
+
+
+# Esri documents service-area breaks as limited to 300 minutes / 300 miles for
+# standard polygons and "reduced to 15 minutes or 15 miles" for detailed ones, so
+# detailed polygons are only requested when every break fits that smaller cap.
+_ESRI_DETAILED_MAX_SECONDS = 15 * 60
+_ESRI_DETAILED_MAX_METERS = 24140  # 15 miles
+
+
+def _esri_output_polygons(opts: IsochroneOptions) -> str:
+    """Detailed polygons when every break fits Esri's detailed-polygon cap,
+    otherwise the service's simplified default."""
+    cap = _ESRI_DETAILED_MAX_SECONDS if opts.type == IsochroneType.TIME else _ESRI_DETAILED_MAX_METERS
+    if all(v <= cap for v in opts.values):
+        return "esriNAOutputPolygonDetailed"
+    return "esriNAOutputPolygonSimplified"
+
+
+def _esri_travel_mode_object(m: TravelMode, label: str) -> Optional[dict]:
+    """The travel-mode object to send, or ``None`` for the service default (driving)."""
     if m == TravelMode.WALKING:
-        return _esri_walking_travel_mode_json()
+        return _esri_walking_travel_mode()
     if m == TravelMode.CYCLING:
         msg = f'{label} does not support travelMode "cycling"'
         raise ConnectorError(ProviderCode.UNSUPPORTED_TRAVEL_MODE, message=msg, provider_message=msg)
-    return ""
+    return None
 
 
-def _esri_routing_restrictions(opts: RoutingOptions) -> str:
+def _esri_apply_travel_mode_and_restrictions(
+    form: dict, mode: TravelMode, restrictions: List[str], label: str
+) -> None:
+    """Set ``travelMode`` and the avoid restrictions on a solve form.
+
+    A travel mode carries its own ``restrictionAttributeNames``, and when one is
+    sent Esri applies that list and IGNORES the top-level parameter beside it —
+    live, a walking mode plus ``restrictionAttributeNames=Avoid Ferries`` reported
+    only the mode's "Avoid Private Roads" as traversed. So with a mode the
+    restrictions are appended to (a copy of) the mode's own list; without one
+    (driving, the service default) the top-level parameter works and is used.
+    """
+    tm = _esri_travel_mode_object(mode, label)
+    if tm is None:
+        if restrictions:
+            form["restrictionAttributeNames"] = ",".join(restrictions)
+        return
+    if restrictions:
+        names = list(tm.get("restrictionAttributeNames") or [])
+        names.extend(r for r in restrictions if r not in names)
+        tm = {**tm, "restrictionAttributeNames": names}
+    form["travelMode"] = json.dumps(tm, separators=(",", ":"), ensure_ascii=False)
+
+
+def _esri_routing_restrictions(opts: RoutingOptions) -> List[str]:
     r = []
     if opts.avoid_tolls:
         r.append("Avoid Toll Roads")
@@ -534,7 +718,25 @@ def _esri_routing_restrictions(opts: RoutingOptions) -> str:
         r.append("Avoid Ferries")
     if opts.avoid_highways:
         r.append("Avoid Limited Access Roads")
-    return ",".join(r)
+    return r
+
+
+def _esri_wants_best_sequence(opts: RoutingOptions) -> bool:
+    """Any of the three optimize flags means "reorder the stops", as on every
+    other provider — a fixed endpoint alone implies optimization."""
+    return opts.optimize or opts.optimize_fixed_origin or opts.optimize_fixed_destination
+
+
+def _esri_preserve_stops(opts: RoutingOptions) -> tuple:
+    """``(preserveFirstStop, preserveLastStop)`` for the normalized flags.
+
+    Plain optimize keeps both ends fixed (the cross-provider meaning); exactly one
+    fixed-endpoint flag frees the OTHER end; both flags keep both."""
+    if opts.optimize_fixed_origin and not opts.optimize_fixed_destination:
+        return True, False
+    if opts.optimize_fixed_destination and not opts.optimize_fixed_origin:
+        return False, True
+    return True, True
 
 
 def _esri_stringify(v: Any) -> str:
@@ -549,7 +751,7 @@ def _esri_stringify(v: Any) -> str:
     return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
 
 
-def _esri_cumulative_stop_costs(features: List[Any]):
+def _esri_cumulative_stop_costs(features: List[Any], time_attr: str):
     """Per-leg distances/durations and the route totals, from the per-stop cumulative costs.
 
     ``Cumul_<attribute>`` is the cost from the origin *to and including* that stop, so a
@@ -561,7 +763,12 @@ def _esri_cumulative_stop_costs(features: List[Any]):
     1. Stops arrive in INPUT order while cumulative costs run along the route, so they
        must be sorted by ``Sequence``. Without it an optimized route yields negative legs.
     2. The field name carries the active impedance — ``Cumul_TravelTime`` driving,
-       ``Cumul_WalkTime`` walking — so the keys are discovered, not hardcoded.
+       ``Cumul_WalkTime`` walking. The connector reads ``Cumul_<time_attr>`` (the time
+       attribute it requested for the mode) and ``Cumul_Kilometers`` by name, so extra
+       accumulate attributes a caller adds (``Miles``, ``TruckTravelTime``) can never
+       change which fields feed the legs. Only when a requested field is absent — a
+       caller replaced the list, or a custom travel mode with its own impedance — are
+       the keys discovered by shape instead.
 
     Returns ``None`` when the values are unusable: fewer than two stops, a stop that
     failed to locate (``Status != 0`` carries no cumulative cost), a non-monotonic
@@ -581,8 +788,14 @@ def _esri_cumulative_stop_costs(features: List[Any]):
     rows.sort(key=lambda a: jnum(a.get("Sequence")))
 
     cumul_keys = [k for k in rows[0] if isinstance(k, str) and k.startswith("Cumul_")]
-    distance_key = next((k for k in cumul_keys if "Kilometers" in k or k.endswith("Miles")), None)
-    time_key = next((k for k in cumul_keys if k != distance_key), None)
+    if "Cumul_Kilometers" in cumul_keys:
+        distance_key = "Cumul_Kilometers"
+    else:
+        distance_key = next((k for k in cumul_keys if "Kilometers" in k or k.endswith("Miles")), None)
+    if f"Cumul_{time_attr}" in cumul_keys:
+        time_key = f"Cumul_{time_attr}"
+    else:
+        time_key = next((k for k in cumul_keys if k != distance_key), None)
     if distance_key is None or time_key is None:
         return None
 
@@ -614,23 +827,29 @@ def _esri_cumulative_stop_costs(features: List[Any]):
     return distances[-1], times[-1], legs
 
 
-def _esri_route_total_distance_meters(attrs: Any) -> float:
+def _esri_route_total_distance_meters(attrs: Any) -> Optional[float]:
     """The route's total distance in meters, matched by shape: the attribute is suffixed
-    with the active distance attribute and this service emits no ``Total_Length``."""
+    with the active distance attribute and this service emits no ``Total_Length``.
+    ``None`` when no distance attribute is present."""
     if jnum_opt(attrs.get("Total_Length")) is not None:
         return jnum(attrs.get("Total_Length"))
     if jnum_opt(attrs.get("Total_Kilometers")) is not None:
         return jnum(attrs.get("Total_Kilometers")) * _KM_TO_M
     if jnum_opt(attrs.get("Total_Miles")) is not None:
         return jnum(attrs.get("Total_Miles")) * _METERS_PER_MILE
-    return 0.0
+    return None
 
 
-def _esri_route_total_duration_seconds(attrs: Any) -> float:
-    """The route's total duration in seconds. Same shape-based match: any ``Total_*``
-    that is not a distance attribute is the time one, in minutes."""
+def _esri_route_total_duration_seconds(attrs: Any, time_attr: str) -> Optional[float]:
+    """The route's total duration in seconds: ``Total_<time_attr>`` when present, else a
+    shape-based match — any ``Total_*`` that is not a distance attribute, in minutes.
+    ``None`` when no time attribute is present."""
     if jnum_opt(attrs.get("Total_Time")) is not None:
         return jnum(attrs.get("Total_Time")) * _MIN_TO_SEC
+    # The requested time attribute before the shape scan, so an extra accumulated
+    # cost attribute is never read as minutes.
+    if jnum_opt(attrs.get(f"Total_{time_attr}")) is not None:
+        return jnum(attrs.get(f"Total_{time_attr}")) * _MIN_TO_SEC
     for key, value in attrs.items():
         name = str(key)
         if not name.startswith("Total_"):
@@ -639,7 +858,7 @@ def _esri_route_total_duration_seconds(attrs: Any) -> float:
             continue
         if jnum_opt(value) is not None:
             return jnum(value) * _MIN_TO_SEC
-    return 0.0
+    return None
 
 
 def _esri_even_split_legs(waypoint_count: int, total_dist: float, total_dur: float) -> List[RoutingLeg]:
@@ -648,13 +867,15 @@ def _esri_even_split_legs(waypoint_count: int, total_dist: float, total_dur: flo
     return [RoutingLeg(total_dist / num_legs, total_dur / num_legs) for _ in range(num_legs)]
 
 
-def _esri_time_attribute_for(mode: Optional[TravelMode]) -> str:
-    """The time attribute to accumulate, which determines the ``Cumul_<attr>`` field name.
+def _esri_routing_accumulate_attributes(mode: Optional[TravelMode]) -> Tuple[str, ...]:
+    """The attributes to accumulate; the time one determines the ``Cumul_<attr>`` field name.
 
-    Must mirror :func:`_esri_travel_mode`: requesting an attribute the active impedance
+    Must mirror :func:`_esri_travel_mode_object`: requesting an attribute the active impedance
     does not use yields no cumulative field at all, silently.
     """
-    return "WalkTime" if mode == TravelMode.WALKING else "TravelTime"
+    if mode == TravelMode.WALKING:
+        return ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_WALKING
+    return ESRI_ROUTING_ACCUMULATE_ATTRIBUTES_DRIVING
 
 
 def _esri_waypoint_order(stops: List[Any], total_stops: int) -> Optional[List[int]]:
@@ -690,14 +911,33 @@ def _esri_matrix_oid(key: Any) -> Optional[int]:
     return None
 
 
-def _esri_decode_cost_cell(cell, time_idx, dist_idx):
-    if isinstance(cell, list):
-        t = cell[time_idx] if 0 <= time_idx < len(cell) else 0
-        d = cell[dist_idx] if 0 <= dist_idx < len(cell) else 0
-        return jnum(t), jnum(d)
-    if isinstance(cell, (int, float)) and not isinstance(cell, bool):
-        return float(cell), 0.0
-    return 0.0, 0.0
+def _esri_decode_cost_cell(cell, time_idx, dist_idx) -> Tuple[Optional[float], Optional[float]]:
+    """``(minutes, kilometers)`` from a sparse-matrix cell, each ``None`` when absent
+    or not a number. A bare number is one cost, never both, so it yields no pair."""
+    if not isinstance(cell, list):
+        return None, None
+    t = cell[time_idx] if 0 <= time_idx < len(cell) else None
+    d = cell[dist_idx] if 0 <= dist_idx < len(cell) else None
+    return jnum_opt(t), jnum_opt(d)
+
+
+def _esri_is_no_address(body: Any) -> bool:
+    """Whether an Esri error body is reverseGeocode's "no address here" answer."""
+    e = jget(body, "error")
+    if _esri_body_error_code(body) != 400:
+        return False
+    texts = [jstr(jget(e, "message"))] + [jstr(d) for d in (jlist(jget(e, "details")) or [])]
+    return any("unable to find address" in t.lower() for t in texts)
+
+
+def _esri_extent_viewport(ext: Any) -> Optional[Viewport]:
+    """A candidate's ``extent`` as a viewport, or None unless all four corners are
+    numbers — a 0-filled corner would silently stretch a consumer's map bounds."""
+    corners = [jnum_opt(jget(ext, k)) for k in ("ymin", "xmin", "ymax", "xmax")]
+    if any(c is None for c in corners):
+        return None
+    ymin, xmin, ymax, xmax = corners
+    return Viewport(LatLng(ymin, xmin), LatLng(ymax, xmax))
 
 
 def _esri_body_error_code(body: Any) -> Optional[int]:

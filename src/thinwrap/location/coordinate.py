@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+import numbers
+from typing import Any, Iterable
 
 from .errors import ConnectorError, ProviderCode
 from .latlng import LatLng
@@ -19,6 +20,25 @@ def assert_finite(c: LatLng, context: str = "") -> None:
     if not is_finite(c.lat) or not is_finite(c.lng):
         where = f" ({context})" if context else ""
         msg = f"Coordinate lat/lng must be finite numbers{where}"
+        raise ConnectorError(ProviderCode.INVALID_REQUEST, message=msg, provider_message=msg)
+
+
+def assert_finite_number(value: Any, label: str) -> None:
+    """Reject a non-finite scalar (a search radius) before it reaches the wire.
+
+    NaN/inf is runtime data a vendor would reject, so it is ``invalid_request``;
+    without this it reaches :func:`fmt_coord`, whose ``int()`` raises a bare
+    ``ValueError``/``OverflowError``.
+
+    Raises:
+        ConnectorError: ``invalid_request`` for NaN or ±inf.
+        TypeError: ``value`` is not a real number (a string, ``None``, a bool) —
+            a wrong argument type, not request data.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"{label} must be a number, got {type(value).__name__}")
+    if not is_finite(value):
+        msg = f"{label} must be a finite number"
         raise ConnectorError(ProviderCode.INVALID_REQUEST, message=msg, provider_message=msg)
 
 

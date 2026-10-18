@@ -6,17 +6,19 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Sequence, Tuple
 
-from ._jsonpath import jget, jlist, jnum, jstr
+from ._jsonpath import jget, jlist, jnum_opt, jstr
+from ._matrix_grid import dimensions_ok, grid_cells
 from ._route_completeness import assert_route_has_legs
-from ._util import decode_json, ok_status
+from ._util import decode_json, ok_status, redact_url_userinfo
 from ._waypoint_order import invert_waypoint_positions
 from .base import BaseConnector
 from .config import OsrmConfig
 from .coordinate import join_coords
+from .defaults import OSRM_TABLE_ANNOTATIONS
 from .enums import PolylineQuality, TravelMode
 from .errors import ConnectorError, ProviderCode, classified_error, invalid_request, provider_error, unknown_error
 from .latlng import LatLng
-from .matrix import MatrixCell, MatrixOptions, MatrixResult
+from .matrix import MatrixOptions, MatrixResult
 from .passthrough import merge_passthrough
 from .routing import RoutingLeg, RoutingOptions, RoutingResult
 
@@ -30,11 +32,13 @@ def _validate_base_url(base_url: str) -> str:
     auth, so there is no default to fall back to (the public demo server is
     deliberately not one).
 
-    Two checks: non-empty, and an ``http://`` or ``https://`` scheme. Without a
-    scheme the default transport raises ``URLError("unsupported URL scheme")``,
-    which ``BaseConnector`` reports as ``provider_unavailable`` behind a redacted
-    message — making a bare host in config look exactly like the server being
-    down. Checking here makes it an ``INVALID_REQUEST`` that names the config.
+    Two checks: non-empty, and an ``http://`` or ``https://`` scheme, so a bare
+    host in config fails as an ``INVALID_REQUEST`` that names the config. ``http://``
+    passes here because an injected Transport may serve it; the default transport
+    is HTTPS-only and refuses it with its own ``INVALID_REQUEST``.
+
+    The rejected value is echoed with its userinfo masked: a base URL for a server
+    behind basic auth carries the credentials inline.
 
     A path prefix is explicitly ALLOWED (hosting OSRM at ``https://host/osrm``
     behind a reverse proxy is a normal deployment); trailing slashes are stripped
@@ -49,7 +53,7 @@ def _validate_base_url(base_url: str) -> str:
     if not base_url.lower().startswith(("http://", "https://")):
         raise ConnectorError(
             ProviderCode.INVALID_REQUEST,
-            message=f"OSRM baseUrl must start with http:// or https:// (got: {base_url})",
+            message=f"OSRM baseUrl must start with http:// or https:// (got: {redact_url_userinfo(base_url)})",
             provider_message="OSRM baseUrl must start with http:// or https://",
         )
     return base_url.rstrip("/")
@@ -83,8 +87,8 @@ class OsrmRoutingConnector(BaseConnector):
 
         # steps and annotations are deliberately NOT sent on /route: nothing in
         # RoutingResult reads them, and leg distance/duration are present regardless
-        # of annotations. (The Table service is different — it forces
-        # annotations=duration,distance because that IS what populates the cells.)
+        # of annotations. (The Table service is different — it defaults
+        # annotations to duration,distance because that IS what populates the cells.)
         base_query = {
             "overview": "full" if opts.polyline_quality == PolylineQuality.DETAILED else "simplified",
             "geometries": "polyline",
@@ -98,10 +102,11 @@ class OsrmRoutingConnector(BaseConnector):
         if use_trip:
             source = "first" if opts.optimize_fixed_origin else "any"
             destination = "last" if opts.optimize_fixed_destination else "any"
-            # OSRM rejects source=any + destination=any with roundtrip=false (HTTP
-            # 400 NotImplemented). A plain optimize (neither endpoint fixed, open
-            # route) therefore keeps the input's first & last fixed and reorders the
-            # middle — matching the Mapbox Optimization v1 sibling.
+            # With roundtrip=false OSRM accepts first/last, first/any and any/last
+            # (trip.cpp IsSupportedParameterCombination: roundtrip || fixed_start ||
+            # fixed_end, since v5.27) and rejects only any/any with HTTP 400
+            # NotImplemented. A plain optimize (neither endpoint fixed, open route)
+            # therefore keeps the input's first & last fixed and reorders the middle.
             if not opts.is_round_trip and source == "any" and destination == "any":
                 source = "first"
                 destination = "last"
@@ -112,7 +117,7 @@ class OsrmRoutingConnector(BaseConnector):
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
         resp = self.send_get(url, m_headers, m_query)
         if not ok_status(resp.status):
-            raise _osrm_http_error(resp.status, resp.headers, resp.body)
+            raise _osrm_http_error(resp.status, resp.headers, resp.body, use_trip)
         raw = decode_json(resp.body)
         if raw is None:
             raise unknown_error(resp.status, None, "OSRM routing returned a malformed response body")
@@ -122,11 +127,16 @@ class OsrmRoutingConnector(BaseConnector):
             routes = raw.get("trips")
         if jstr(raw.get("code") if isinstance(raw, dict) else "") != "Ok" or not routes:
             raise _osrm_route_in_body_error(raw, use_trip, resp.status)
-        route = routes[0]
+        route = routes[0] if isinstance(routes, list) else None
+        if not isinstance(route, dict):
+            raise unknown_error(resp.status, raw, "OSRM returned a malformed route")
+        legs = []
+        for leg in jlist(route.get("legs")) or []:
+            distance, duration = _osrm_distance_duration(leg, resp.status, raw)
+            legs.append(RoutingLeg(distance, duration))
+        total_distance, total_duration = _osrm_distance_duration(route, resp.status, raw)
 
-        legs = [RoutingLeg(jnum(l.get("distance")), jnum(l.get("duration"))) for l in (route.get("legs") or [])]
-
-        assert_route_has_legs(len(legs), len(wps), 'OSRM routing', raw)
+        assert_route_has_legs(len(legs), len(wps), "OSRM routing", raw, resp.status)
 
         waypoint_order = None
         wps_out = raw.get("waypoints")
@@ -145,8 +155,8 @@ class OsrmRoutingConnector(BaseConnector):
 
         return RoutingResult(
             legs=legs,
-            total_distance_meters=jnum(route.get("distance")),
-            total_duration_seconds=jnum(route.get("duration")),
+            total_distance_meters=total_distance,
+            total_duration_seconds=total_duration,
             polyline=jstr(route.get("geometry")),  # OSRM polyline is already precision-5
             waypoint_order=waypoint_order,
             raw=raw,
@@ -160,10 +170,10 @@ class OsrmMatrixConnector(BaseConnector):
 
     def matrix(self, opts: MatrixOptions) -> MatrixResult:
         base_url = _validate_base_url(self.cfg.base_url)
-        if opts.departure_time is not None:
-            raise ConnectorError(ProviderCode.UNSUPPORTED_FIELD, message="OSRM does not support departureTime", provider_message="OSRM does not support departureTime")
-        if opts.avoid_tolls:
-            raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message="OSRM does not support avoidTolls", provider_message="avoidTolls is not supported by OSRM")
+        # traffic_mode and departure_time are ignored, as on routing (see
+        # _validate_routing_compat).
+        # Same rule as routing: honoured only when the operator declared the class.
+        _require_exclude_class("avoid_tolls", "toll", opts.avoid_tolls, self.cfg.supported_exclude_classes)
         if not opts.origins or not opts.destinations:
             raise invalid_request("OSRM Matrix requires at least one origin and one destination")
 
@@ -172,10 +182,11 @@ class OsrmMatrixConnector(BaseConnector):
         sources = ";".join(str(i) for i in range(len(opts.origins)))
         dests = ";".join(str(i + len(opts.origins)) for i in range(len(opts.destinations)))
         url = f"{base_url}/table/v1/{profile}/{coords}"
-        # `annotations` is a connector default set BEFORE the merge so a consumer's
-        # passthrough.query can override it (setting it after the merge silently
-        # ignored the override).
-        base_query = {"sources": sources, "destinations": dests, "annotations": "duration,distance"}
+        # `annotations` is a default, not an invariant: it sits in the base query so a
+        # consumer's passthrough.query replaces it like any other list default.
+        base_query = {"sources": sources, "destinations": dests, "annotations": ",".join(OSRM_TABLE_ANNOTATIONS)}
+        if opts.avoid_tolls:
+            base_query["exclude"] = "toll"
         _, m_headers, m_query = merge_passthrough({}, {}, opts.passthrough, base_query)
 
         resp = self.send_get(url, m_headers, m_query)
@@ -183,23 +194,14 @@ class OsrmMatrixConnector(BaseConnector):
             raise _osrm_http_error(resp.status, resp.headers, resp.body)
         raw = decode_json(resp.body)
         if not isinstance(raw, dict) or raw.get("code") != "Ok":
-            raise _osrm_matrix_in_body_error(raw)
+            raise _osrm_matrix_in_body_error(raw, resp.status)
 
-        durations = raw.get("durations") or []
-        distances = raw.get("distances") or []
+        durations = raw.get("durations")
+        distances = raw.get("distances")
         no, nd = len(opts.origins), len(opts.destinations)
-        if not _osrm_dimensions_ok(durations, distances, no, nd):
+        if not dimensions_ok(durations, distances, no, nd):
             raise unknown_error(resp.status, raw, "OSRM matrix returned a table that does not match the requested dimensions")
-        # OSRM `/table` returns null for an unroutable pair — omit the cell rather
-        # than coercing to 0 (which reads as "same location"). Contract:
-        # missing/failed entries are omitted from cells.
-        cells = [
-            MatrixCell(oi, di, jnum(distances[oi][di]), jnum(durations[oi][di]))
-            for oi in range(no)
-            for di in range(nd)
-            if distances[oi][di] is not None and durations[oi][di] is not None
-        ]
-        return MatrixResult(cells=cells, raw=raw)
+        return MatrixResult(cells=grid_cells(durations, distances, no, nd), raw=raw)
 
 
 # ---- shared osrm helpers ----
@@ -216,8 +218,10 @@ def _osrm_avoid_flags(opts: RoutingOptions) -> List[Tuple[str, str, bool]]:
 
 
 def _validate_routing_compat(opts: RoutingOptions, supported: Sequence[str] = ()) -> None:
-    if opts.departure_time is not None:
-        raise ConnectorError(ProviderCode.UNSUPPORTED_FIELD, message="OSRM does not support departureTime", provider_message="OSRM does not support departureTime")
+    # OSRM has no time parameter and no request-time traffic: traffic needs a
+    # graph rebuilt with "edge weight updates" (osrm-backend wiki, Traffic). So
+    # traffic_mode is ignored, and departure_time with it — under NONE a time has
+    # no effect by definition, so refusing it would reject a valid request.
 
     # Whether an avoid-flag works depends on the OPERATOR'S build, not on OSRM:
     # exclude=toll is rejected as InvalidValue by the public demo build and honoured
@@ -226,12 +230,26 @@ def _validate_routing_compat(opts: RoutingOptions, supported: Sequence[str] = ()
     # declared is still rejected up front rather than sent and bounced with an
     # opaque vendor error.
     for flag, exclude_class, requested in _osrm_avoid_flags(opts):
-        if requested and exclude_class not in supported:
-            msg = (
-                f"{flag} requires an OSRM build with the '{exclude_class}' exclude "
-                "class compiled in; declare it via OsrmConfig.supported_exclude_classes"
-            )
-            raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message=msg, provider_message=msg)
+        _require_exclude_class(flag, exclude_class, requested, supported)
+
+
+def _require_exclude_class(flag: str, exclude_class: str, requested: bool, supported: Sequence[str]) -> None:
+    """Reject a requested avoid-flag whose exclude class the operator has not declared."""
+    if requested and exclude_class not in supported:
+        msg = (
+            f"{flag} requires an OSRM build with the '{exclude_class}' exclude "
+            "class compiled in; declare it via OsrmConfig.supported_exclude_classes"
+        )
+        raise ConnectorError(ProviderCode.UNSUPPORTED_OPTION, message=msg, provider_message=msg)
+
+
+def _osrm_distance_duration(obj: Any, status: int, raw: Any) -> Tuple[float, float]:
+    """A route's or leg's ``distance``/``duration``. OSRM always sends both, so a
+    missing one is a malformed response rather than a free, instant trip."""
+    distance, duration = jnum_opt(jget(obj, "distance")), jnum_opt(jget(obj, "duration"))
+    if distance is None or duration is None:
+        raise unknown_error(status, raw, "OSRM returned a route or leg without distance/duration")
+    return distance, duration
 
 
 def _osrm_classify_envelope_code(code: str, message: str, use_trip: bool) -> Optional[ProviderCode]:
@@ -258,6 +276,10 @@ def _osrm_classify_envelope_code(code: str, message: str, use_trip: bool) -> Opt
         return ProviderCode.NO_ROUTE if use_trip else None
     if code in ("InvalidQuery", "InvalidOptions", "InvalidValue", "TooBig"):
         return ProviderCode.INVALID_REQUEST
+    if code == "NotImplemented":
+        # A trip endpoint combination this server does not implement: any/any on an
+        # open trip, or first/any / any/last on a build older than v5.27.
+        return ProviderCode.UNSUPPORTED_OPTION
     return None
 
 
@@ -287,12 +309,11 @@ def _osrm_error_message(body: Any) -> str:
     return jstr(jget(body, "message")) or jstr(jget(body, "error"))
 
 
-def _osrm_http_error(status: int, headers, data: bytes) -> ConnectorError:
+def _osrm_http_error(status: int, headers, data: bytes, use_trip: bool = False) -> ConnectorError:
     raw = decode_json(data)
-    # use_trip is not threaded here: the /trip-only NoTrips code stays unclassified
-    # on this shared path, which is the conservative choice for a helper also used
-    # by the Table service.
-    return provider_error(status, headers, raw, _osrm_map_vendor_error(status, raw), _osrm_error_message(raw))
+    # OSRM serves NoTrips with a 4xx as readily as in a 200 envelope, so /trip
+    # classifies it the same on both paths. The Table service never produces it.
+    return provider_error(status, headers, raw, _osrm_map_vendor_error(status, raw, use_trip), _osrm_error_message(raw))
 
 
 def _osrm_route_in_body_error(body: Any, use_trip: bool, status_code: int) -> ConnectorError:
@@ -303,13 +324,11 @@ def _osrm_route_in_body_error(body: Any, use_trip: bool, status_code: int) -> Co
 
     An ``Ok`` envelope with an empty ``routes[]`` is ``NO_ROUTE``, not ``UNKNOWN``:
     the envelope says the request was fine and the server answered, there is simply
-    nothing to return. Reported as unknown it produced the message "OSRM returned
-    code: Ok", which reads like a success and gave a consumer nothing to branch on —
-    while Google's empty ``routes[]`` has always mapped to ``no_route``.
+    nothing to return — the same outcome as Google's empty ``routes[]``, so a
+    consumer gets one "provider answered, no route" case to branch on.
 
-    ``status_code`` is the real HTTP status rather than ``None``: this path is only
-    reachable on a 2xx, and nulling it made an answered request look like a
-    transport failure.
+    ``status_code`` is the real HTTP status: the server answered, and a ``None``
+    status is what a transport failure looks like.
     """
     code = jstr(jget(body, "code"))
     message = jstr(jget(body, "message"))
@@ -323,18 +342,15 @@ def _osrm_route_in_body_error(body: Any, use_trip: bool, status_code: int) -> Co
     return classified_error(pc, status_code, body, pm)
 
 
-def _osrm_matrix_in_body_error(body: Any) -> ConnectorError:
+def _osrm_matrix_in_body_error(body: Any, status_code: int) -> ConnectorError:
+    """Map a 2xx Table envelope that is not ``Ok``, with the same envelope codes as
+    routing (a ``NoSegment`` is a coordinate with no road to snap to on either
+    service). ``NoTable`` is the Table service's own invalid-request code."""
     code = jstr(jget(body, "code"))
     message = jstr(jget(body, "message"))
-    pc = ProviderCode.INVALID_REQUEST if code in ("NoTable", "InvalidQuery", "InvalidOptions") else ProviderCode.UNKNOWN
+    if code == "NoTable":
+        pc = ProviderCode.INVALID_REQUEST
+    else:
+        pc = _osrm_classify_envelope_code(code, message, False) or ProviderCode.UNKNOWN
     pm = message or f"OSRM returned code: {code or 'unknown'}"
-    return classified_error(pc, None, body, pm)
-
-
-def _osrm_dimensions_ok(durations, distances, no, nd) -> bool:
-    if len(durations) < no or len(distances) < no:
-        return False
-    for i in range(no):
-        if len(durations[i]) < nd or len(distances[i]) < nd:
-            return False
-    return True
+    return classified_error(pc, status_code, body, pm)

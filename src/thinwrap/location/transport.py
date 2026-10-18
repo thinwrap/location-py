@@ -14,6 +14,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Protocol, runtime_checkable
 
+from .errors import ConnectorError, invalid_request
+
 # The default transport is HTTPS-only. This closes the stdlib opener's file://,
 # ftp:// and data: handlers (so a config-/consumer-supplied base_url cannot turn
 # into a local-file read) AND refuses cleartext http. A consumer with a
@@ -73,7 +75,11 @@ class UrllibTransport:
     def send(self, request: HttpRequest) -> HttpResponse:
         scheme = urllib.parse.urlsplit(request.url).scheme.lower()
         if scheme not in _ALLOWED_SCHEMES:
-            raise urllib.error.URLError(f"unsupported URL scheme: {scheme or '(none)'}")
+            # A configuration problem, not an unreachable provider — so a typed
+            # invalid_request that says what to do, rather than a transport failure
+            # the caller would read as the server being down. The URL itself is
+            # never echoed: a self-hosted base URL may carry userinfo credentials.
+            raise _scheme_refused(scheme)
         req = urllib.request.Request(
             request.url,
             data=request.body,
@@ -93,6 +99,19 @@ class UrllibTransport:
             # transport failure.
             hdrs = {k.lower(): v for k, v in (exc.headers or {}).items()}
             return HttpResponse(status=exc.code, headers=hdrs, body=exc.read())
+
+
+def _scheme_refused(scheme: str) -> ConnectorError:
+    if scheme == "http":
+        return invalid_request(
+            "The default transport is HTTPS-only and refuses http:// URLs. To reach a "
+            "cleartext http endpoint (e.g. a self-hosted OSRM on a private network), "
+            "inject your own Transport via the facade's transport= argument."
+        )
+    return invalid_request(
+        f"The default transport only sends https:// URLs (got scheme: {scheme or '(none)'}). "
+        "Inject your own Transport via the facade's transport= argument for anything else."
+    )
 
 
 _default_transport: UrllibTransport | None = None

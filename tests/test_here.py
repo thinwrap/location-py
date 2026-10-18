@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import types
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from helpers import FakeTransport, body_json, gzip_resp, no_sleep, qget, resp
+from helpers import FakeTransport, body_json, gzip_resp, no_sleep, path_of, qget, resp
 
 from thinwrap.location import (
     AutocompleteOptions,
@@ -22,8 +24,10 @@ from thinwrap.location import (
     Passthrough,
     ProviderCode,
     Routing,
+    RoutingInclude,
     RoutingOptions,
     ReverseGeocodeOptions,
+    TrafficMode,
     TravelMode,
 )
 
@@ -267,3 +271,370 @@ def test_isochrone_rejects_cycling():
     with pytest.raises(ConnectorError) as ei:
         iso.isochrone(IsochroneOptions(center=LatLng(1, 1), type=IsochroneType.TIME, values=[600], travel_mode=TravelMode.CYCLING))
     assert ei.value.provider_code == ProviderCode.UNSUPPORTED_TRAVEL_MODE
+
+
+def _here_section(kind, mode, length, duration, arrival_waypoint=None, base=None):
+    """A HERE v8 route section. ``TransitSection`` is used only for ferries and car
+    shuttles; ``arrival.place.waypoint`` is present only when the place is the
+    request's ``via`` with that index (never for origin/destination)."""
+    place = {"type": "place", "location": {"lat": 50.0, "lng": 8.6}}
+    if arrival_waypoint is not None:
+        place["waypoint"] = arrival_waypoint
+    summary = {"length": length, "duration": duration}
+    if base is not None:
+        summary["baseDuration"] = base
+    return {
+        "type": kind,
+        "transport": {"mode": mode},
+        "departure": {"place": {"type": "place", "location": {"lat": 50.1, "lng": 8.5}}},
+        "arrival": {"place": place},
+        "summary": summary,
+        "polyline": FLEX,
+    }
+
+
+def test_routing_ferry_sections_fold_into_one_leg_between_two_waypoints():
+    body = json.dumps({"routes": [{"sections": [
+        _here_section("vehicle", "car", 1000, 60),
+        _here_section("transit", "ferry", 5000, 1800),
+        _here_section("vehicle", "car", 2000, 120),
+    ]}]})
+    res = Routing(HereConfig("k"), transport=FakeTransport(resp(200, body))).route(
+        RoutingOptions(waypoints=[LatLng(50.1, 8.5), LatLng(50.0, 8.6)])
+    )
+    assert len(res.legs) == 1
+    assert res.legs[0].distance_meters == 8000 and res.legs[0].duration_seconds == 1980
+    assert res.total_distance_meters == 8000 and res.total_duration_seconds == 1980
+
+
+def test_routing_legs_close_at_via_waypoints_not_at_mode_changes():
+    body = json.dumps({"routes": [{"sections": [
+        _here_section("vehicle", "car", 1000, 60, base=50),
+        _here_section("transit", "ferry", 5000, 1800, base=1800),
+        _here_section("vehicle", "car", 2000, 120, arrival_waypoint=0, base=100),
+        _here_section("vehicle", "car", 3000, 180, base=170),
+    ]}]})
+    res = Routing(HereConfig("k"), transport=FakeTransport(resp(200, body))).route(
+        RoutingOptions(
+            waypoints=[LatLng(50.1, 8.5), LatLng(50.2, 8.6), LatLng(50.0, 8.7)],
+            include=[RoutingInclude.DURATION_WITHOUT_TRAFFIC],
+        )
+    )
+    assert [(l.distance_meters, l.duration_seconds) for l in res.legs] == [(8000, 1980), (3000, 180)]
+    assert [l.duration_without_traffic_seconds for l in res.legs] == [1950, 170]
+    assert res.total_duration_without_traffic_seconds == 2120
+    assert sum(l.distance_meters for l in res.legs) == res.total_distance_meters
+
+
+def test_routing_sections_without_waypoint_markers_stay_one_to_one():
+    body = json.dumps({"routes": [{"sections": [
+        {"polyline": FLEX, "summary": {"length": 10, "duration": 1}},
+        {"polyline": FLEX, "summary": {"length": 20, "duration": 2}},
+    ]}]})
+    res = Routing(HereConfig("k"), transport=FakeTransport(resp(200, body))).route(
+        RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)])
+    )
+    assert [(l.distance_meters, l.duration_seconds) for l in res.legs] == [(10, 1), (20, 2)]
+
+
+# Live HERE geocode for "Empire State Building, New York": `title` is the POI name,
+# `address.label` the full address.
+_ESB_ITEM = {
+    "title": "Empire State Building",
+    "id": "here:pds:place:840dr5ru-esb",
+    "resultType": "place",
+    "address": {"label": "Empire State Building, 20 W 34th St, New York, NY 10118, United States"},
+    "position": {"lat": 40.74844, "lng": -73.98566},
+}
+
+
+def test_geocode_formatted_address_is_the_address_label_not_the_title():
+    fake = FakeTransport(resp(200, json.dumps({"items": [_ESB_ITEM]})))
+    res = Geocoding(HereConfig("k"), transport=fake).geocode(GeocodeOptions(address="Empire State Building, New York"))
+    assert res.candidates[0].formatted_address == "Empire State Building, 20 W 34th St, New York, NY 10118, United States"
+
+
+def test_reverse_geocode_formatted_address_is_the_address_label():
+    item = {**_ESB_ITEM, "title": "20 W 34th St"}
+    fake = FakeTransport(resp(200, json.dumps({"items": [item]})))
+    res = Geocoding(HereConfig("k"), transport=fake).reverse_geocode(ReverseGeocodeOptions(location=LatLng(40.74844, -73.98566)))
+    assert res.candidates[0].formatted_address.startswith("Empire State Building, 20 W 34th St")
+
+
+def test_place_details_address_is_the_label_and_name_is_the_title():
+    from thinwrap.location import PlaceDetailsInclude, PlaceDetailsOptions
+
+    fake = FakeTransport(resp(200, json.dumps(_ESB_ITEM)))
+    res = Geocoding(HereConfig("k"), transport=fake).place_details(
+        PlaceDetailsOptions(place_id=_ESB_ITEM["id"], include=[PlaceDetailsInclude.NAME])
+    )
+    assert res.candidate.formatted_address == _ESB_ITEM["address"]["label"]
+    assert res.name == "Empire State Building"
+
+
+def test_geocode_falls_back_to_the_title_without_a_label():
+    item = {"title": "Somewhere", "position": {"lat": 1, "lng": 2}}
+    fake = FakeTransport(resp(200, json.dumps({"items": [item]})))
+    res = Geocoding(HereConfig("k"), transport=fake).geocode(GeocodeOptions(address="x"))
+    assert res.candidates[0].formatted_address == "Somewhere"
+
+
+def test_config_repr_hides_the_api_key():
+    assert "here-secret" not in repr(HereConfig("here-secret"))
+
+
+# ---------------------------------------------------------------------------
+# Traffic is off unless traffic_mode=LIVE. HERE applies live traffic whenever
+# departureTime is omitted and bills /v8/routes as Time-Aware Routing unless the
+# request carries departureTime=any or traffic[mode]=disabled.
+# ---------------------------------------------------------------------------
+
+_ROUTES_BODY = '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":1,"duration":1}}]}]}'
+_DEPART = dt.datetime(2026, 9, 27, 8, 30, tzinfo=dt.timezone.utc)
+_DEPART_ISO = "2026-09-27T08:30:00.000Z"
+
+
+def _route_query(**kw):
+    fake = FakeTransport(resp(200, _ROUTES_BODY))
+    Routing(HereConfig("k"), transport=fake).route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)], **kw))
+    return parse_qs(urlsplit(fake.last.url).query)
+
+
+def test_routing_default_sends_departure_time_any_without_traffic_mode():
+    # `any` rather than traffic[mode]=disabled: it drops dynamic traffic but keeps
+    # long-term closures, and there is no caller time to preserve.
+    q = _route_query()
+    assert q["departureTime"] == ["any"]
+    assert "traffic[mode]" not in q
+
+
+def test_routing_none_with_departure_time_keeps_the_time_and_disables_traffic():
+    q = _route_query(traffic_mode=TrafficMode.NONE, departure_time=_DEPART)
+    assert q["departureTime"] == [_DEPART_ISO]
+    assert q["traffic[mode]"] == ["disabled"]
+
+
+def test_routing_live_sends_neither_switch():
+    # HERE's own default (no departureTime) is live traffic.
+    q = _route_query(traffic_mode=TrafficMode.LIVE)
+    assert "departureTime" not in q
+    assert "traffic[mode]" not in q
+
+
+def test_routing_live_with_departure_time_sends_only_the_time():
+    q = _route_query(traffic_mode=TrafficMode.LIVE, departure_time=_DEPART)
+    assert q["departureTime"] == [_DEPART_ISO]
+    assert "traffic[mode]" not in q
+
+
+def test_routing_optimized_routes_call_gets_the_same_traffic_default():
+    findseq = resp(200, '{"results":[{"waypoints":[{"id":"start","sequence":0},{"id":"destination1","sequence":1},{"id":"end","sequence":2}]}]}')
+    fake = FakeTransport(findseq, resp(200, _ROUTES_BODY))
+    Routing(HereConfig("k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True)
+    )
+    assert path_of(fake.calls[1]) == "/v8/routes"
+    q = parse_qs(urlsplit(fake.calls[1].url).query)
+    assert q["departureTime"] == ["any"]
+    assert "traffic[mode]" not in q
+    # findsequence2 carries traffic in its own `mode` grammar, not departureTime.
+    assert qget(fake.calls[0], "mode") == "fastest;car;traffic:disabled"
+    assert qget(fake.calls[0], "departureTime") == ""
+
+
+def test_routing_passthrough_overrides_the_traffic_default():
+    q = _route_query(
+        departure_time=_DEPART,
+        passthrough=Passthrough(query={"traffic[mode]": "default"}),
+    )
+    assert q["traffic[mode]"] == ["default"]
+    assert q["departureTime"] == [_DEPART_ISO]
+
+
+def _matrix_body(**kw):
+    submit = resp(200, '{"matrixId":"mid","statusUrl":"https://matrix.router.hereapi.com/v8/matrix/mid/status"}')
+    poll = resp(200, '{"matrixId":"mid","status":"completed","resultUrl":"' + _RESULT_URL + '"}')
+    retrieve = resp(200, '{"matrixId":"mid","matrix":{"numOrigins":1,"numDestinations":1,"travelTimes":[1],"distances":[1]}}')
+    fake = FakeTransport(submit, poll, retrieve)
+    Matrix(HereConfig("k"), transport=fake, sleep=no_sleep).matrix(
+        MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(2, 2)], **kw)
+    )
+    return body_json(fake.calls[0])
+
+
+def test_matrix_default_sends_departure_time_any_without_traffic():
+    b = _matrix_body()
+    assert b["departureTime"] == "any"
+    assert "traffic" not in b
+
+
+def test_matrix_none_with_departure_time_keeps_the_time_and_disables_traffic():
+    b = _matrix_body(traffic_mode=TrafficMode.NONE, departure_time=_DEPART)
+    assert b["departureTime"] == _DEPART_ISO
+    assert b["traffic"] == {"mode": "disabled"}
+
+
+def test_matrix_live_sends_neither_switch():
+    b = _matrix_body(traffic_mode=TrafficMode.LIVE)
+    assert "departureTime" not in b
+    assert "traffic" not in b
+
+
+def test_matrix_live_with_departure_time_sends_only_the_time():
+    b = _matrix_body(traffic_mode=TrafficMode.LIVE, departure_time=_DEPART)
+    assert b["departureTime"] == _DEPART_ISO
+    assert "traffic" not in b
+
+
+def test_matrix_passthrough_overrides_the_traffic_default():
+    b = _matrix_body(
+        departure_time=_DEPART,
+        passthrough=Passthrough(body={"traffic": {"mode": "default"}}),
+    )
+    assert b["traffic"] == {"mode": "default"}
+    assert b["departureTime"] == _DEPART_ISO
+
+
+# A time field arriving through passthrough switches the NONE default from
+# departureTime=any to traffic disabled: HERE answers `any` + arrivalTime with
+# 400 on both endpoints, and a passthrough departureTime would replace `any`
+# and put the request back on the Time-Aware SKU.
+
+
+def test_routing_passthrough_arrival_time_disables_traffic_instead_of_any():
+    q = _route_query(passthrough=Passthrough(query={"arrivalTime": _DEPART_ISO}))
+    assert "departureTime" not in q
+    assert q["arrivalTime"] == [_DEPART_ISO]
+    assert q["traffic[mode]"] == ["disabled"]
+
+
+def test_routing_passthrough_departure_time_disables_traffic():
+    q = _route_query(passthrough=Passthrough(query={"departureTime": _DEPART_ISO}))
+    assert q["departureTime"] == [_DEPART_ISO]
+    assert q["traffic[mode]"] == ["disabled"]
+
+
+def test_matrix_passthrough_arrival_time_disables_traffic_instead_of_any():
+    b = _matrix_body(passthrough=Passthrough(body={"arrivalTime": _DEPART_ISO}))
+    assert "departureTime" not in b
+    assert b["arrivalTime"] == _DEPART_ISO
+    assert b["traffic"] == {"mode": "disabled"}
+
+
+def test_matrix_passthrough_departure_time_disables_traffic():
+    b = _matrix_body(passthrough=Passthrough(body={"departureTime": _DEPART_ISO}))
+    assert b["departureTime"] == _DEPART_ISO
+    assert b["traffic"] == {"mode": "disabled"}
+
+
+# `disabled` would also drop long-term closures, which `any` keeps.
+
+
+def test_routing_passthrough_departure_time_any_keeps_the_default():
+    q = _route_query(passthrough=Passthrough(query={"departureTime": "any"}))
+    assert q["departureTime"] == ["any"]
+    assert "traffic[mode]" not in q
+
+
+def test_matrix_passthrough_departure_time_any_keeps_the_default():
+    b = _matrix_body(passthrough=Passthrough(body={"departureTime": "any"}))
+    assert b["departureTime"] == "any"
+    assert "traffic" not in b
+
+
+# --- findsequence2 orders stops under the same avoids as /routes ---------------
+
+_FINDSEQ_OK = '{"results":[{"waypoints":[{"id":"start","sequence":0},{"id":"destination1","sequence":1},{"id":"end","sequence":2}]}]}'
+_ROUTES_OK = '{"routes":[{"sections":[{"polyline":"' + FLEX + '","summary":{"length":10,"duration":20}}]}]}'
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ({"avoid_highways": True}, "fastest;car;traffic:disabled;motorway:-3"),
+    ({"avoid_ferries": True}, "fastest;car;traffic:disabled;boatFerry:-3,railFerry:-3"),
+    (
+        {"avoid_tolls": True, "avoid_highways": True, "avoid_ferries": True},
+        "fastest;car;traffic:disabled;tollroad:-3,motorway:-3,boatFerry:-3,railFerry:-3",
+    ),
+    ({}, "fastest;car;traffic:disabled"),
+])
+def test_findsequence_mode_carries_every_avoid_in_one_feature_segment(flags, expected):
+    fake = FakeTransport(resp(200, _FINDSEQ_OK), resp(200, _ROUTES_OK))
+    Routing(HereConfig("k"), transport=fake).route(
+        RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True, **flags)
+    )
+    assert qget(fake.calls[0], "mode") == expected
+
+
+# --- malformed 2xx bodies never become zero-valued successes --------------------
+
+@pytest.mark.parametrize("body", ['{"routes":[null]}', '{"routes":[{"sections":[null]}]}'])
+def test_routing_malformed_route_is_unknown(body):
+    with pytest.raises(ConnectorError) as ei:
+        Routing(HereConfig("k"), transport=FakeTransport(resp(200, body))).route(
+            RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)])
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+def test_routing_route_without_sections_is_an_error():
+    with pytest.raises(ConnectorError):
+        Routing(HereConfig("k"), transport=FakeTransport(resp(200, '{"routes":[{"sections":[]}]}'))).route(
+            RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)])
+        )
+
+
+def test_findsequence_non_object_entry_is_unknown():
+    fake = FakeTransport(resp(200, '{"results":[{"waypoints":[null]}]}'))
+    with pytest.raises(ConnectorError) as ei:
+        Routing(HereConfig("k"), transport=fake).route(
+            RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3)], optimize=True)
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+def test_matrix_null_value_is_a_failed_cell_not_zero():
+    submit = resp(200, '{"matrixId":"mid","statusUrl":"https://matrix.router.hereapi.com/v8/matrix/mid/status"}')
+    poll = resp(200, '{"status":"completed","resultUrl":"' + _RESULT_URL + '"}')
+    body = resp(200, '{"matrix":{"numOrigins":1,"numDestinations":2,"travelTimes":[60,null],"distances":[1000,500]}}')
+    res = Matrix(HereConfig("k"), transport=FakeTransport(submit, poll, body), sleep=no_sleep).matrix(
+        MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(3, 3), LatLng(4, 4)])
+    )
+    assert [(c.destination_index, c.duration_seconds) for c in res.cells] == [(0, 60)]
+
+
+# --- isochrone ------------------------------------------------------------------
+
+@pytest.mark.parametrize("body", [
+    "",
+    '{"isolines":[]}',
+    '{"isolines":[{"range":{"value":600},"polygons":[]}]}',
+    '{"isolines":[{"range":{},"polygons":[{"outer":"' + FLEX + '"}]}]}',
+])
+def test_isochrone_without_a_usable_polygon_is_unknown(body):
+    with pytest.raises(ConnectorError) as ei:
+        Isochrone(HereConfig("k"), transport=FakeTransport(resp(200, body))).isochrone(
+            IsochroneOptions(center=LatLng(52.5, 13.4), type=IsochroneType.TIME, values=[600])
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+def test_isochrone_departure_time_is_validated():
+    fake = FakeTransport()
+    with pytest.raises(ConnectorError) as ei:
+        Isochrone(HereConfig("k"), transport=fake).isochrone(
+            IsochroneOptions(center=LatLng(52.5, 13.4), type=IsochroneType.TIME, values=[600], departure_time="noon")
+        )
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+    assert fake.calls == []
+
+
+def test_isochrone_departure_datetime_is_sent_as_utc_iso():
+    body = '{"isolines":[{"range":{"value":600},"polygons":[{"outer":"' + FLEX + '"}]}]}'
+    fake = FakeTransport(resp(200, body))
+    Isochrone(HereConfig("k"), transport=fake).isochrone(
+        IsochroneOptions(
+            center=LatLng(52.5, 13.4), type=IsochroneType.TIME, values=[600],
+            departure_time=dt.datetime(2026, 9, 1, 8, 0, tzinfo=dt.timezone.utc),
+        )
+    )
+    assert qget(fake.last, "departureTime") == "2026-09-01T08:00:00Z"

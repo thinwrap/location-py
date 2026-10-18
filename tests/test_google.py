@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from helpers import FakeTransport, body_json, path_of, qget, resp
 
@@ -35,7 +37,7 @@ def test_routing_complete():
 
 
 def test_routing_waypoint_order():
-    fake = FakeTransport(resp(200, '{"routes":[{"legs":[],"distanceMeters":1,"duration":"1s","polyline":{"encodedPolyline":"x"},"optimizedIntermediateWaypointIndex":[1,0]}]}'))
+    fake = FakeTransport(resp(200, '{"routes":[{"legs":[{"distanceMeters":1,"duration":"1s"}],"distanceMeters":1,"duration":"1s","polyline":{"encodedPolyline":"x"},"optimizedIntermediateWaypointIndex":[1,0]}]}'))
     r = Routing(GoogleConfig("k"), transport=fake)
     res = r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2), LatLng(3, 3), LatLng(4, 4)], optimize=True))
     assert res.waypoint_order == [0, 2, 1, 3]
@@ -94,7 +96,7 @@ def test_reason_based_auth_mapping():
 
 
 def test_matrix_ndjson():
-    ndjson = '{"originIndex":0,"destinationIndex":0,"distanceMeters":1000,"duration":"600s"}\n{"originIndex":0,"destinationIndex":1,"status":{"code":3}}\n{"originIndex":1,"destinationIndex":0,"distanceMeters":2000,"duration":"1200s"}'
+    ndjson = '{"originIndex":0,"destinationIndex":0,"distanceMeters":1000,"duration":"600s","status":{},"condition":"ROUTE_EXISTS"}\n{"originIndex":0,"destinationIndex":1,"status":{"code":3}}\n{"originIndex":1,"destinationIndex":0,"distanceMeters":2000,"duration":"1200s","status":{},"condition":"ROUTE_EXISTS"}'
     fake = FakeTransport(resp(200, ndjson))
     m = Matrix(GoogleConfig("k"), transport=fake)
     res = m.matrix(MatrixOptions(origins=[LatLng(1, 1), LatLng(2, 2)], destinations=[LatLng(3, 3), LatLng(4, 4)]))
@@ -105,12 +107,56 @@ def test_matrix_ndjson():
 def test_geocode():
     fake = FakeTransport(resp(200, '{"status":"OK","results":[{"formatted_address":"New York, NY","geometry":{"location":{"lat":40.7,"lng":-74.0},"viewport":{"southwest":{"lat":40.4,"lng":-74.3},"northeast":{"lat":40.9,"lng":-73.7}}},"place_id":"pid"}]}'))
     g = Geocoding(GoogleConfig("k"), transport=fake)
-    res = g.geocode(GeocodeOptions(address="NYC", country_filter=["US", "CA"], language="en"))
+    res = g.geocode(GeocodeOptions(address="NYC", country_filter=["US"], language="en"))
     c = res.candidates[0]
     assert c.formatted_address == "New York, NY" and c.location.lat == 40.7 and c.place_id == "pid"
     assert c.viewport.northeast.lat == 40.9
-    assert qget(fake.last, "components") == "country:US|country:CA"
+    assert qget(fake.last, "components") == "country:US"
     assert qget(fake.last, "language") == "en"
+
+
+@pytest.mark.parametrize("countries", [["US", "CA"], ["CA", "US"]])
+def test_geocode_with_more_than_one_country_is_refused_before_any_request(countries):
+    # Live: components=country:US|country:CA returned Windsor, CT only and CA|US
+    # Windsor, ON only — Google applies the first country and pads with unrelated
+    # results, so a multi-country filter would silently drop the others.
+    fake = FakeTransport()
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(GoogleConfig("k"), transport=fake).geocode(GeocodeOptions(address="Windsor", country_filter=countries))
+    assert ei.value.provider_code == ProviderCode.UNSUPPORTED_OPTION
+    assert fake.calls == []
+
+
+def test_autocomplete_bad_key_is_auth_failed():
+    # Live Places (New) answer for an invalid key: HTTP 400 INVALID_ARGUMENT with
+    # an ErrorInfo reason of API_KEY_INVALID.
+    body = (
+        '{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.",'
+        '"status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo",'
+        '"reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"places.googleapis.com"}}]}}'
+    )
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(GoogleConfig("bad"), transport=FakeTransport(resp(400, body))).autocomplete(AutocompleteOptions(input="Dizengoff"))
+    assert ei.value.provider_code == ProviderCode.AUTH_FAILED
+    assert ei.value.status_code == 400
+    assert ei.value.provider_message == "API key not valid. Please pass a valid API key."
+
+
+def test_autocomplete_plain_invalid_argument_stays_invalid_request():
+    body = '{"error":{"code":400,"message":"Invalid input.","status":"INVALID_ARGUMENT"}}'
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(GoogleConfig("k"), transport=FakeTransport(resp(400, body))).autocomplete(AutocompleteOptions(input="x"))
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+
+
+def test_geocode_http_error_honours_an_error_info_reason():
+    body = (
+        '{"error":{"code":400,"message":"API key not valid.","status":"INVALID_ARGUMENT",'
+        '"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com"}]}}'
+    )
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(GoogleConfig("bad"), transport=FakeTransport(resp(400, body))).geocode(GeocodeOptions(address="x"))
+    assert ei.value.provider_code == ProviderCode.AUTH_FAILED
 
 
 def test_geocode_in_body_status_error():
@@ -175,3 +221,61 @@ def test_session_token_wire_spelling():
     fake3 = FakeTransport(resp(200, '{"suggestions":[]}'))
     Geocoding(GoogleConfig(api_key="k"), transport=fake3).autocomplete(AutocompleteOptions(input="Diz"))
     assert "sessionToken" not in body_json(fake3.last)
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("OVER_DAILY_LIMIT", ProviderCode.AUTH_FAILED),
+    ("UNKNOWN_ERROR", ProviderCode.PROVIDER_UNAVAILABLE),
+    ("OVER_QUERY_LIMIT", ProviderCode.RATE_LIMITED),
+    ("REQUEST_DENIED", ProviderCode.AUTH_FAILED),
+])
+def test_geocoding_body_status_mapping(status, expected):
+    body = json.dumps({"status": status, "results": [], "error_message": "m"})
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(GoogleConfig("k"), transport=FakeTransport(resp(200, body))).geocode(GeocodeOptions(address="x"))
+    assert ei.value.provider_code == expected
+    assert ei.value.status_code == 200
+
+
+def test_matrix_element_without_status_or_condition_is_a_failed_cell():
+    ndjson = (
+        '{"originIndex":0,"destinationIndex":0,"distanceMeters":5,"duration":"5s","condition":"ROUTE_EXISTS"}\n'
+        '{"originIndex":0,"destinationIndex":1}'
+    )
+    res = Matrix(GoogleConfig("k"), transport=FakeTransport(resp(200, ndjson))).matrix(
+        MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(3, 3), LatLng(4, 4)])
+    )
+    # (0,1) says nothing about reachability — omitted, not a 0 m / 0 s cell.
+    assert [(c.origin_index, c.destination_index) for c in res.cells] == [(0, 0)]
+
+
+@pytest.mark.parametrize("body", ["", "   \n", "[]"])
+def test_matrix_with_no_elements_is_unknown(body):
+    with pytest.raises(ConnectorError) as ei:
+        Matrix(GoogleConfig("k"), transport=FakeTransport(resp(200, body))).matrix(
+            MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(3, 3)])
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+    assert ei.value.status_code == 200
+
+
+def test_matrix_non_finite_ndjson_token_is_unknown_with_status():
+    with pytest.raises(ConnectorError) as ei:
+        Matrix(GoogleConfig("k"), transport=FakeTransport(resp(200, '{"originIndex":0,"distanceMeters":NaN}'))).matrix(
+            MatrixOptions(origins=[LatLng(1, 1)], destinations=[LatLng(3, 3)])
+        )
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+    assert ei.value.status_code == 200
+
+
+@pytest.mark.parametrize("body", ['{"routes":[null]}', '{"routes":[{"distanceMeters":1,"duration":"1s","legs":[null]}]}'])
+def test_routing_malformed_route_is_unknown(body):
+    with pytest.raises(ConnectorError) as ei:
+        Routing(GoogleConfig("k"), transport=FakeTransport(resp(200, body))).route(RoutingOptions(waypoints=TWO))
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
+
+
+def test_routing_route_without_legs_is_an_error():
+    body = '{"routes":[{"distanceMeters":1,"duration":"1s"}]}'
+    with pytest.raises(ConnectorError):
+        Routing(GoogleConfig("k"), transport=FakeTransport(resp(200, body))).route(RoutingOptions(waypoints=TWO))

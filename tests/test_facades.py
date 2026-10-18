@@ -23,6 +23,7 @@ from thinwrap.location import (
     Routing,
     RoutingOptions,
     TomTomConfig,
+    TrafficMode,
     TravelMode,
 )
 from thinwrap.location.transport import HttpRequest
@@ -36,14 +37,28 @@ def test_provider_ids():
 
 
 def test_unsupported_operations():
+    # Misuse, so a native ValueError at construction — never a ConnectorError.
     # OSRM: no geocoding, no isochrone.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as ei:
         Geocoding(OsrmConfig("http://x"))
+    assert not isinstance(ei.value, ConnectorError)
     with pytest.raises(ValueError):
         Isochrone(OsrmConfig("http://x"))
     # Google: no isochrone.
     with pytest.raises(ValueError):
         Isochrone(GoogleConfig("k"))
+
+
+@pytest.mark.parametrize("facade", [Routing, Matrix, Geocoding, Isochrone])
+def test_none_config_is_a_type_error_not_an_attribute_error(facade):
+    with pytest.raises(TypeError, match="requires a provider config") as ei:
+        facade(None)
+    assert not isinstance(ei.value, ConnectorError)
+
+
+def test_string_transport_is_a_type_error_not_provider_unavailable():
+    with pytest.raises(TypeError, match="transport"):
+        Routing(GoogleConfig("k"), transport="x")
 
 
 class _ErrTransport:
@@ -62,10 +77,15 @@ def test_transport_error_redacts_and_normalizes():
 
 
 def test_google_departure_time_and_walking():
-    fake = FakeTransport(resp(200, '{"routes":[{"legs":[],"distanceMeters":1,"duration":"1s","polyline":{"encodedPolyline":"x"}}]}'))
+    fake = FakeTransport(resp(200, '{"routes":[{"legs":[{"distanceMeters":1,"duration":"1s"}],"distanceMeters":1,"duration":"1s","polyline":{"encodedPolyline":"x"}}]}'))
     r = Routing(GoogleConfig("k"), transport=fake)
     when = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
-    r.route(RoutingOptions(waypoints=[LatLng(1, 1), LatLng(2, 2)], departure_time=when, travel_mode=TravelMode.WALKING))
+    r.route(
+        RoutingOptions(
+            waypoints=[LatLng(1, 1), LatLng(2, 2)], departure_time=when, travel_mode=TravelMode.WALKING,
+            traffic_mode=TrafficMode.TRAFFIC,
+        )
+    )
     b = body_json(fake.last)
     assert b["travelMode"] == "WALK"
     # Google rejects routingPreference for WALK/BICYCLE, so it is omitted even

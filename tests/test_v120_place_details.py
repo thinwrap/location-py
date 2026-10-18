@@ -13,6 +13,7 @@ probing showed the key alone resolves to the byte-identical candidate — so
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 from helpers import FakeTransport, qget, resp
@@ -201,13 +202,13 @@ def test_mapbox_forwards_session_token():
     assert qget(fake.last, "session_token") == "sess-123"
 
 
-def test_mapbox_omits_session_token_when_none_is_given():
+def test_mapbox_generates_a_session_token_when_none_is_given():
     fake = FakeTransport(resp(200, MAPBOX_BODY))
     Geocoding(MapboxConfig("pk"), transport=fake).place_details(
         PlaceDetailsOptions(place_id="mb1")
     )
-    # Not sent as an empty string, which Mapbox would treat as a new session.
-    assert qget(fake.last, "session_token") == ""
+    # session_token is REQUIRED on /retrieve; Mapbox recommends a UUIDv4.
+    assert uuid.UUID(qget(fake.last, "session_token")).version == 4
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +223,48 @@ def test_mapbox_omits_session_token_when_none_is_given():
     (TomTomConfig("k"), json.dumps({"results": []})),
     (EsriConfig(api_key="k"), json.dumps({"candidates": []})),
 ])
-def test_an_unusable_result_raises_no_route(cfg, body):
+def test_an_unusable_result_returns_no_candidate(cfg, body):
+    # An id that resolves to nothing is an answer, like geocoding's zero results.
+    result = Geocoding(cfg, transport=FakeTransport(resp(200, body))).place_details(
+        PlaceDetailsOptions(place_id="x", include=[PlaceDetailsInclude.NAME])
+    )
+    assert result.candidate is None
+    assert result.name is None
+    assert result.raw == json.loads(body)
+
+
+@pytest.mark.parametrize("cfg,body", [
+    (GoogleConfig("k"), json.dumps({"error": {"code": 404, "message": "Not found", "status": "NOT_FOUND"}})),
+    (HereConfig("k"), json.dumps({"status": 404, "title": "Unknown Location ID"})),
+    (MapboxConfig("pk"), json.dumps({"message": {"error": "No data found for requested ID"}})),
+])
+def test_a_vendor_404_returns_no_candidate(cfg, body):
+    result = Geocoding(cfg, transport=FakeTransport(resp(404, body))).place_details(
+        PlaceDetailsOptions(place_id="x")
+    )
+    assert result.candidate is None
+    assert result.raw == json.loads(body)
+
+
+# A malformed id is the caller's bug, not an unknown place.
+def test_google_malformed_id_stays_invalid_request():
+    body = json.dumps({"error": {"code": 400, "message": "Invalid id", "status": "INVALID_ARGUMENT"}})
     with pytest.raises(ConnectorError) as ei:
-        Geocoding(cfg, transport=FakeTransport(resp(200, body))).place_details(
+        Geocoding(GoogleConfig("k"), transport=FakeTransport(resp(400, body))).place_details(
+            PlaceDetailsOptions(place_id="!!")
+        )
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("cfg", [
+    GoogleConfig("k"), HereConfig("k"), MapboxConfig("pk"), TomTomConfig("k"), EsriConfig(api_key="k"),
+])
+def test_an_unparseable_2xx_body_is_unknown_not_an_empty_result(cfg):
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(cfg, transport=FakeTransport(resp(200, "<html>oops</html>"))).place_details(
             PlaceDetailsOptions(place_id="x")
         )
-    assert ei.value.provider_code == ProviderCode.NO_ROUTE
+    assert ei.value.provider_code == ProviderCode.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +360,23 @@ def test_esri_never_emits_structured_format():
     assert len(result.predictions) == 1
     assert result.predictions[0].structured_format is None
     assert result.predictions[0].description == "Rijksmuseum, Museumstraat 1, Amsterdam"
+
+
+# Live: Google answers a well-formed but unknown id exactly like a malformed one
+# (400 INVALID_ARGUMENT), HERE a malformed id with 400 — both stay errors.
+@pytest.mark.parametrize("cfg,body", [
+    (GoogleConfig("k"), json.dumps({"error": {"code": 400, "message": "The provided Place ID: x is not valid.", "status": "INVALID_ARGUMENT"}})),
+    (HereConfig("k"), json.dumps({"status": 400, "title": "Illegal input for parameter 'id'"})),
+])
+def test_a_vendor_400_for_the_id_stays_invalid_request(cfg, body):
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(cfg, transport=FakeTransport(resp(400, body))).place_details(PlaceDetailsOptions(place_id="x"))
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST
+
+
+# Live: a stale magicKey is an in-body error 400, not an unknown place.
+def test_esri_stale_magic_key_stays_an_error():
+    body = json.dumps({"error": {"code": 400, "message": "MagicKey was not generated from the current release and is no longer valid", "details": []}})
+    with pytest.raises(ConnectorError) as ei:
+        Geocoding(EsriConfig(api_key="k"), transport=FakeTransport(resp(200, body))).place_details(PlaceDetailsOptions(place_id="mk"))
+    assert ei.value.provider_code == ProviderCode.INVALID_REQUEST

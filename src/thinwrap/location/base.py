@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
-from ._util import build_url, compact_json, redact_credentials
+from ._util import QueryValue, build_url, compact_json, redact_credentials
 from .errors import ConnectorError, ProviderCode
+from .passthrough import merge_headers
 from .transport import HttpRequest, HttpResponse, Transport, default_transport
 
 
@@ -15,12 +17,21 @@ class BaseConnector:
     in the per-provider connectors that subclass this."""
 
     def __init__(self, transport: Optional[Transport] = None) -> None:
-        self._transport: Transport = transport or default_transport()
+        """Raises:
+            TypeError: ``transport`` is not ``None`` and has no callable ``send``.
+                Checked here, not on the first request, because the broad handler
+                in :meth:`_invoke` would otherwise report the resulting
+                ``AttributeError`` as ``provider_unavailable`` — a bug in the
+                calling code presented as a retryable outage.
+        """
+        if transport is not None and not callable(getattr(transport, "send", None)):
+            raise TypeError(f"transport must implement Transport (a callable send()), got {type(transport).__name__}")
+        self._transport: Transport = transport if transport is not None else default_transport()
 
-    def send_get(self, url: str, headers: Mapping[str, str] | None = None, query: Mapping[str, str] | None = None) -> HttpResponse:
+    def send_get(self, url: str, headers: Mapping[str, str] | None = None, query: Mapping[str, QueryValue] | None = None) -> HttpResponse:
         return self._invoke("GET", build_url(url, query), None, None, headers)
 
-    def send_post_json(self, url: str, body: Any, headers: Mapping[str, str] | None = None, query: Mapping[str, str] | None = None) -> HttpResponse:
+    def send_post_json(self, url: str, body: Any, headers: Mapping[str, str] | None = None, query: Mapping[str, QueryValue] | None = None) -> HttpResponse:
         try:
             data = compact_json(body)
         except (TypeError, ValueError) as exc:
@@ -32,20 +43,23 @@ class BaseConnector:
             ) from exc
         return self._invoke("POST", build_url(url, query), data, "application/json", headers)
 
-    def send_post_form(self, url: str, form: Mapping[str, str], headers: Mapping[str, str] | None = None, query: Mapping[str, str] | None = None) -> HttpResponse:
+    def send_post_form(self, url: str, form: Mapping[str, str], headers: Mapping[str, str] | None = None, query: Mapping[str, QueryValue] | None = None) -> HttpResponse:
         from urllib.parse import urlencode
 
         data = urlencode(dict(form)).encode("utf-8")
         return self._invoke("POST", build_url(url, query), data, "application/x-www-form-urlencoded", headers)
 
     def _invoke(self, method: str, url: str, body: bytes | None, content_type: str | None, headers: Mapping[str, str] | None) -> HttpResponse:
-        h: dict[str, str] = {}
-        if content_type:
-            h["Content-Type"] = content_type
-        if headers:
-            h.update(headers)
+        # Case-insensitive overlay, so a caller's `content-type` replaces the
+        # connector's rather than going out as a second header.
+        h = merge_headers({"Content-Type": content_type} if content_type else {}, headers or {})
+        request = HttpRequest(method=method, url=url, headers=h, body=body)
+        # Resolved before the try: only a failure INSIDE send() is a transport
+        # failure. A missing or broken `send` is a caller bug and must surface as
+        # itself, not be reclassified as provider_unavailable below.
+        send = self._transport.send
         try:
-            return self._transport.send(HttpRequest(method=method, url=url, headers=h, body=body))
+            return send(request)
         except ConnectorError:
             raise
         except Exception as exc:  # transport failure (connection/DNS/timeout)
@@ -61,7 +75,7 @@ class BaseConnector:
             # A BYO transport (requests/httpx/…) may embed the full request URL —
             # including credential query params — in its exception message. Keep
             # only a redacted STRING.
-            msg = redact_credentials(str(exc))
+            msg = _scrub_url_userinfo(redact_credentials(str(exc)), url)
             code = _classify_transport_failure(exc)
         # Raised OUTSIDE the except block on purpose: implicit exception chaining
         # only happens while an exception is being handled, so neither .__cause__
@@ -74,6 +88,27 @@ class BaseConnector:
             provider_message=msg,
             cause=msg,
         )
+
+
+def _scrub_url_userinfo(msg: str, url: str) -> str:
+    """Remove the request URL's own userinfo credentials from a transport message.
+
+    Pattern-based redaction only sees ``scheme://user:pass@`` intact, and transports
+    do not quote it that way: the stdlib parses ``https://user:pass@host`` as a host
+    of ``user:pass@host`` and fails with ``nonnumeric port: 'pass@host'``. Scrubbing
+    the known username/password strings covers whatever form the message takes."""
+    try:
+        parts = urlsplit(url)
+        password = parts.password
+    except ValueError:
+        return msg
+    userinfo = parts.netloc.rpartition("@")[0]
+    # The whole `user:pass` first, then the password alone; a bare username is not
+    # a credential, and replacing a short one everywhere would garble the message.
+    for secret in (userinfo, password):
+        if secret:
+            msg = msg.replace(secret, "[REDACTED]")
+    return msg
 
 
 def _response_from_raised_http_error(exc: BaseException) -> Optional[HttpResponse]:

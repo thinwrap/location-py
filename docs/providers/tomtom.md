@@ -45,7 +45,21 @@ Create a key at https://developer.tomtom.com/user/me/apps. Sent as `key=` query 
 
 ### Input
 
-Standard `RoutingOptions`. `optimize=True` maps to `computeBestOrder=true`.
+Standard `RoutingOptions`. Any of `optimize`, `optimize_fixed_origin`,
+`optimize_fixed_destination` maps to `computeBestOrder=true` (with three or more
+waypoints). TomTom always keeps **both** the first and the last waypoint fixed and has no
+way to free one end, so a single fixed-endpoint flag also leaves the other end in place.
+
+`traffic_mode` is always sent, because TomTom's `traffic` defaults to on: `NONE` ⇒
+`traffic=false`, `TRAFFIC`/`LIVE` ⇒ `traffic=true`; `departure_time` ⇒ `departAt` either way.
+**`NONE` is approximate here.** TomTom routing has no time-independent mode (`departAt=any`
+is rejected with `traffic=false`), and under `traffic=false` "the effect of historic traffic
+on effective road speeds is still incorporated" — so durations include typical traffic for
+the departure time, or for now.
+
+The avoid flags are sent as a **repeated** `avoid` parameter
+(`avoid=tollRoads&avoid=motorways`): calculateRoute rejects a comma-joined list with
+`400 Invalid avoid value`.
 
 ### `waypoint_order`
 
@@ -105,11 +119,30 @@ Each instruction carries `instructionType` and `maneuver` (two separate vocabula
 
 ### Endpoint
 
-`POST https://api.tomtom.com/routing/matrix/2`
+`POST https://api.tomtom.com/routing/matrix/2` for up to **100 cells** (origins × destinations);
+larger grids go to `POST https://api.tomtom.com/routing/matrix/2/async` (submit → poll → result,
+up to 2500 cells). TomTom's synchronous endpoint allows 100 cells by default — 200 only for a
+narrow `departAt=any` historical-traffic request, 2500 only on Enterprise plans.
+
+A large async result is answered with HTTP 302 and a temporary download URL in `Location`. The
+connector follows that one hop itself (https only, never cached), without the API key, which the
+download URL does not need.
 
 ### Input
 
-Standard `MatrixOptions`. Cycling travel mode raises `ConnectorError` with `provider_code` `unsupported_travel_mode` if TomTom rejects the request.
+Standard `MatrixOptions`. Cycling travel mode raises `ConnectorError` with `provider_code` `unsupported_travel_mode` before any request is sent: Matrix v2 has no bicycle mode, so the connector rejects it locally rather than spending a round-trip on a certain 400.
+
+`traffic_mode` is sent as `options.traffic`. `NONE` ⇒ `"historical"` with `departAt: "any"`,
+TomTom's time-independent average; a `departure_time` is dropped, since historical traffic at
+a real time is typical traffic for that time. `TRAFFIC`/`LIVE` ⇒ `"live"` with the
+`departure_time` as given, or `departAt: "now"` without one (TomTom rejects `"live"` with
+`departAt=any`, HTTP 400). The 200-cell
+synchronous allowance is not used (it holds only for historical traffic and no other
+options), so the 100-cell sync/async split is the same for both.
+
+The async poll deadline defaults to 60 s; override it with `passthrough.body["timeoutMs"]`,
+a finite number of milliseconds greater than 0. Anything else — a numeric string, NaN, zero,
+a negative — raises `invalid_request` before any request is sent.
 
 ---
 
@@ -167,3 +200,21 @@ res = geo.autocomplete(AutocompleteOptions(input="Dizen", country_filter=["IL", 
 ### Input
 
 Standard `IsochroneOptions`. `type` `IsochroneType.TIME` ⇒ `timeBudgetInSec=`; `type` `IsochroneType.DISTANCE` ⇒ `distanceBudgetInMeters=`. Multi-value calls fan out via one request per value.
+
+`departure_time` ⇒ `departAt=`. It must be an ISO-8601 date-time string (sent verbatim) or a
+`datetime` (sent as UTC). A string that is not an ISO-8601 date-time raises `invalid_request`
+before any request is sent; any other type is a `TypeError` when the options are constructed.
+Isochrones have no `traffic_mode`, so a `departure_time` (sent as `departAt`) makes the
+contour traffic-aware for that time, using the traffic TomTom expects then. No `traffic`
+parameter is sent, so TomTom's defaults apply (`traffic=true`, `departAt=now`): without a
+`departure_time` the range reflects the traffic now. `Passthrough(query={"traffic": "false"})`
+ignores current traffic, but historic traffic still applies, as on Routing.
+
+Driving only: TomTom states that in `calculateReachableRange` requests "the values bicycle and
+pedestrian must not be used", so `TravelMode.WALKING` and `TravelMode.CYCLING` raise
+`ConnectorError` with `provider_code` `unsupported_travel_mode` before any request is sent.
+
+### Output
+
+The reachable range is one boundary, so a contour is always a single-ring `Polygon`, closed and
+wound counter-clockwise (RFC 7946).
