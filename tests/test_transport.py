@@ -110,3 +110,17 @@ def test_default_transport_is_a_shared_urllib_transport():
     assert isinstance(t, UrllibTransport)
     assert t is default_transport()
     assert t._timeout == _DEFAULT_TIMEOUT_SECONDS
+
+
+def test_default_user_agent_is_sent_because_cloudflare_blocks_urllibs():
+    handler = _FakeHTTPS(200)
+    _transport_with(handler).send(HttpRequest(method="GET", url="https://api.example.com/x"))
+    assert handler.requests[0].get_header("User-agent") == "thinwrap-location-python"
+
+
+@pytest.mark.parametrize("key", ["User-Agent", "user-agent"])
+def test_a_user_agent_on_the_request_wins(key):
+    handler = _FakeHTTPS(200)
+    _transport_with(handler).send(HttpRequest(method="GET", url="https://api.example.com/x", headers={key: "acme/2"}))
+    assert handler.requests[0].get_header("User-agent") == "acme/2"
+    assert [k for k in handler.requests[0].header_items() if k[0].lower() == "user-agent"] == [("User-agent", "acme/2")]

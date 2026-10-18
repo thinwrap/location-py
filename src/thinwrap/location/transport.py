@@ -65,6 +65,20 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Cloudflare-fronted APIs can answer urllib's default `Python-urllib/3.x`
+# User-Agent with 403 "error code: 1010" (Resend, MailerSend, Discord and Groq
+# do; no location vendor does today), so the default transport names itself.
+# A User-Agent already on the request wins.
+_USER_AGENT = "thinwrap-location-python"
+
+
+def _with_user_agent(headers: Mapping[str, str]) -> dict:
+    out = dict(headers)
+    if not any(k.lower() == "user-agent" for k in out):
+        out["User-Agent"] = _USER_AGENT
+    return out
+
+
 class UrllibTransport:
     """Default synchronous transport built on the standard library."""
 
@@ -84,7 +98,7 @@ class UrllibTransport:
             request.url,
             data=request.body,
             method=request.method,
-            headers=dict(request.headers),
+            headers=_with_user_agent(request.headers),
         )
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:

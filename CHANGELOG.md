@@ -31,6 +31,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The default transport sends a `thinwrap-location-python` User-Agent instead of urllib's, which Cloudflare-fronted APIs refuse with a 403.
 - Google routing and matrix no longer fail with HTTP 400 when a `departure_time` is given under the default `TrafficMode.NONE`.
 - TomTom matrix honours `traffic_mode` (`options.traffic`, plus `departAt: "now"` when live without a time); `LIVE` was ignored.
 - OSRM matrix honours `avoid_tolls` when `"toll"` is a declared exclude class, as routing does.
